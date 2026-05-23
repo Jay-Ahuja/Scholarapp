@@ -2,9 +2,9 @@
 
 Public entry point: `find_professors(field, count, user_interests)`. The pipeline:
 
-1. Resolve the user's free-text `field` to OpenAlex concept IDs (LLM pick over
-   top OpenAlex /concepts results).
-2. Query OpenAlex /authors filtered by those concepts, scoped to academic
+1. Resolve the user's free-text `field` to OpenAlex topic IDs (LLM pick over
+   top OpenAlex /topics results).
+2. Query OpenAlex /authors filtered by those topics, scoped to academic
    institutions, sorted by citation count. Over-fetch ~3x because email
    resolution drops candidates.
 3. For each author, in parallel (semaphore-bounded), fetch the 5 most recent
@@ -14,6 +14,12 @@ Public entry point: `find_professors(field, count, user_interests)`. The pipelin
 
 Network calls go through `_request_with_retry`, which retries 429/5xx with
 exponential backoff (max 3 attempts) and honors `Retry-After` headers.
+
+NOTE on the topics taxonomy: OpenAlex deprecated the `concepts` filter for
+authors in late 2024 — `concepts.id:...` and `x_concepts.id:...` both now
+return zero results. We use `topics.id:...` against the /topics endpoint. The
+topic hierarchy is domain > field > subfield > topic; we show the LLM the
+subfield + field names so it can pick well.
 """
 
 from __future__ import annotations
@@ -34,7 +40,11 @@ logger = logging.getLogger(__name__)
 
 OPENALEX_BASE = "https://api.openalex.org"
 TAVILY_URL = "https://api.tavily.com/search"
-MODEL = "claude-sonnet-4-6"
+# Model tiers. Both LLM calls in discovery are narrow extraction tasks (pick 1-2
+# topic IDs; pull one email from web snippets) — Haiku handles them at parity with
+# Sonnet at 1/3 the cost. See docs/04-discovery.md.
+MODEL_SONNET = "claude-sonnet-4-6"
+MODEL_HAIKU = "claude-haiku-4-5"
 CONCURRENCY = 10
 OVERFETCH_MULTIPLIER = 3
 HTTP_TIMEOUT = 30.0
@@ -95,8 +105,8 @@ class ProfessorCandidate(BaseModel):
 # Internal extraction schemas used as Anthropic tool input_schemas.
 
 
-class _ConceptPick(BaseModel):
-    concept_ids: list[str] = Field(min_length=1, max_length=2)
+class _TopicPick(BaseModel):
+    topic_ids: list[str] = Field(min_length=1, max_length=2)
     rationale: str = ""
 
 
@@ -220,50 +230,51 @@ def _get_anthropic_client() -> anthropic.AsyncAnthropic:
     return anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
 
 
-async def _llm_pick_concepts(
+async def _llm_pick_topics(
     anthropic_client: anthropic.AsyncAnthropic, field: str, candidates: list[dict]
 ) -> list[str]:
-    """Have Claude select 1–2 OpenAlex concept IDs that match the user's field."""
-    system_text = _load_prompt("pick_concepts.txt")
+    """Have Claude select 1–2 OpenAlex topic IDs that match the user's field."""
+    system_text = _load_prompt("pick_topics.txt")
     summarized = [
         {
             "id": _short_id(c["id"]),
             "display_name": c.get("display_name", ""),
-            "level": c.get("level"),
+            "subfield": (c.get("subfield") or {}).get("display_name", ""),
+            "field": (c.get("field") or {}).get("display_name", ""),
+            "keywords": ", ".join((c.get("keywords") or [])[:6]),
             "description": (c.get("description") or "")[:200],
         }
         for c in candidates
     ]
-    user_text = (
-        f"field: {field}\n\ncandidates:\n"
-        + "\n".join(
-            f"- {s['id']}  level={s['level']}  {s['display_name']}: {s['description']}"
-            for s in summarized
-        )
+    user_text = f"field: {field}\n\ncandidates:\n" + "\n".join(
+        f"- {s['id']}  [{s['field']} > {s['subfield']}]  {s['display_name']}\n"
+        f"    keywords: {s['keywords']}\n"
+        f"    description: {s['description']}"
+        for s in summarized
     )
     response = await anthropic_client.messages.create(
-        model=MODEL,
+        model=MODEL_HAIKU,
         max_tokens=512,
         system=[
             {"type": "text", "text": system_text, "cache_control": {"type": "ephemeral"}}
         ],
         tools=[
             _tool(
-                "select_concepts",
-                "Save the 1-2 best matching OpenAlex concept IDs.",
-                _ConceptPick.model_json_schema(),
+                "select_topics",
+                "Save the 1-2 best matching OpenAlex topic IDs.",
+                _TopicPick.model_json_schema(),
             )
         ],
-        tool_choice={"type": "tool", "name": "select_concepts"},
+        tool_choice={"type": "tool", "name": "select_topics"},
         messages=[{"role": "user", "content": user_text}],
     )
-    raw = _extract_tool_input(response, "select_concepts")
+    raw = _extract_tool_input(response, "select_topics")
     try:
-        pick = _ConceptPick.model_validate(raw)
+        pick = _TopicPick.model_validate(raw)
     except ValidationError as e:
-        raise DiscoveryError(f"Concept pick was malformed: {e}") from e
+        raise DiscoveryError(f"Topic pick was malformed: {e}") from e
     allowed = {s["id"] for s in summarized}
-    return [cid for cid in pick.concept_ids if cid in allowed]
+    return [tid for tid in pick.topic_ids if tid in allowed]
 
 
 async def _llm_extract_email(
@@ -283,7 +294,7 @@ async def _llm_extract_email(
         f"professor: {name}\ninstitution: {institution}\n\nresults:\n{rendered_results}"
     )
     response = await anthropic_client.messages.create(
-        model=MODEL,
+        model=MODEL_HAIKU,
         max_tokens=512,
         system=[
             {"type": "text", "text": system_text, "cache_control": {"type": "ephemeral"}}
@@ -311,7 +322,7 @@ async def _llm_extract_email(
 # ---------------------------------------------------------------------------
 
 
-async def _resolve_concepts(
+async def _resolve_topics(
     http: httpx.AsyncClient,
     anthropic_client: anthropic.AsyncAnthropic,
     field: str,
@@ -319,34 +330,34 @@ async def _resolve_concepts(
     response = await _request_with_retry(
         http,
         "GET",
-        f"{OPENALEX_BASE}/concepts",
+        f"{OPENALEX_BASE}/topics",
         params={"search": field, "per_page": 10},
     )
     candidates = response.json().get("results", [])
     if not candidates:
         raise DiscoveryError(
-            f"OpenAlex returned no concepts for field {field!r}. "
+            f"OpenAlex returned no topics for field {field!r}. "
             "Try a more standard term (e.g., 'computational neuroscience' instead of 'comp neuro')."
         )
-    chosen = await _llm_pick_concepts(anthropic_client, field, candidates)
+    chosen = await _llm_pick_topics(anthropic_client, field, candidates)
     if not chosen:
         raise DiscoveryError(
-            f"Could not match field {field!r} to an OpenAlex concept."
+            f"Could not match field {field!r} to an OpenAlex topic."
         )
     return chosen
 
 
 async def _list_authors(
-    http: httpx.AsyncClient, concept_ids: list[str], target_count: int
+    http: httpx.AsyncClient, topic_ids: list[str], target_count: int
 ) -> list[dict]:
-    concept_filter = "|".join(concept_ids)  # OR over concepts
+    topic_filter = "|".join(topic_ids)  # OR over topics
     response = await _request_with_retry(
         http,
         "GET",
         f"{OPENALEX_BASE}/authors",
         params={
             "filter": (
-                f"x_concepts.id:{concept_filter},"
+                f"topics.id:{topic_filter},"
                 "last_known_institutions.type:education,"
                 "works_count:>10"
             ),
@@ -440,15 +451,15 @@ async def find_professors(
     anthropic_client = _get_anthropic_client()
 
     async with httpx.AsyncClient(headers=headers, timeout=HTTP_TIMEOUT) as http:
-        concept_ids = await _resolve_concepts(http, anthropic_client, field)
-        logger.info("Resolved field %r to concept ids %s", field, concept_ids)
+        topic_ids = await _resolve_topics(http, anthropic_client, field)
+        logger.info("Resolved field %r to topic ids %s", field, topic_ids)
 
         target_pool = count * OVERFETCH_MULTIPLIER
-        authors = await _list_authors(http, concept_ids, target_pool)
+        authors = await _list_authors(http, topic_ids, target_pool)
         if not authors:
             raise DiscoveryError(
                 f"OpenAlex returned no authors for field {field!r}. "
-                "The concept may be too narrow."
+                "The topic may be too narrow."
             )
         logger.info("OpenAlex returned %d candidate authors", len(authors))
 

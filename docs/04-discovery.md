@@ -22,18 +22,18 @@ pool by interest" logic.
 field (str) ──┐
               ▼
     ┌─────────────────────┐
-    │ GET /concepts       │  OpenAlex
+    │ GET /topics         │  OpenAlex
     │ ?search=<field>     │
     └─────────┬───────────┘
-              │  candidates: [{id, display_name, level, description}, ...]
+              │  candidates: [{id, display_name, field, subfield, keywords, ...}]
               ▼
     ┌─────────────────────┐
-    │ Claude: pick 1-2    │  prompts/pick_concepts.txt → _ConceptPick
+    │ Claude: pick 1-2    │  prompts/pick_topics.txt → _TopicPick
     └─────────┬───────────┘
-              │  concept_ids: [C42, ...]
+              │  topic_ids: [T10077, ...]
               ▼
     ┌─────────────────────┐
-    │ GET /authors        │  filter=x_concepts.id:C42|C43,
+    │ GET /authors        │  filter=topics.id:T10077|T11601,
     │  &sort=cited_by     │         last_known_institutions.type:education,
     │                     │         works_count:>10
     └─────────┬───────────┘
@@ -68,20 +68,23 @@ limits.
 
 | Endpoint | What we ask | Filter / sort |
 |---|---|---|
-| `GET /concepts` | Candidate concept IDs for a free-text field | `?search={field}&per_page=10` |
-| `GET /authors` | Top-cited academic authors in those concepts | `?filter=x_concepts.id:{C…}\|{C…},last_known_institutions.type:education,works_count:>10&sort=cited_by_count:desc` |
+| `GET /topics` | Candidate topic IDs for a free-text field | `?search={field}&per_page=10` |
+| `GET /authors` | Top-cited academic authors in those topics | `?filter=topics.id:{T…}\|{T…},last_known_institutions.type:education,works_count:>10&sort=cited_by_count:desc` |
 | `GET /works` | 5 most recent works per author | `?filter=author.id:{A…}&sort=publication_date:desc&per_page=5` |
 
 Reference docs:
 
-- Concepts entity: https://docs.openalex.org/api-entities/concepts
+- Topics entity: https://docs.openalex.org/api-entities/topics
 - Authors filtering: https://docs.openalex.org/api-entities/authors/filter-authors
 - Works filtering: https://docs.openalex.org/api-entities/works/filter-works
 - Polite pool: https://docs.openalex.org/how-to-use-the-api/api-overview#the-polite-pool
 
-Concepts vs topics: OpenAlex is migrating from "concepts" to "topics." The concepts
-taxonomy still works and is the simpler match for free-text fields. If you switch to
-topics later, the filter becomes `topics.id:T…` and `/concepts` becomes `/topics`.
+**Why topics, not concepts:** OpenAlex deprecated the `concepts.id` filter for authors
+in late 2024 — querying it returns 0 results even for valid concept IDs. The replacement
+is the topics taxonomy, organized as **domain > field > subfield > topic**. Topics
+themselves don't have a numeric level; instead, their position is defined by the
+hierarchy above. The LLM-pick step uses `field` + `subfield` as the strongest signal
+of relevance.
 
 ## Why two sources (OpenAlex + Tavily) instead of one
 
@@ -102,28 +105,32 @@ topics later, the filter becomes `topics.id:T…` and `/concepts` becomes `/topi
 - Bottom line: OpenAlex for what's clean and structured; Tavily + LLM for the messy
   bit (contact info). One source for each side of the problem.
 
-## Field → concept resolution
+## Field → topic resolution
 
 We send the user's free-text field (e.g., `"neuroscience"`, `"robotics"`,
-`"computational social science"`) to `/concepts?search=...`. OpenAlex returns up to
-10 candidates, each with `display_name`, `level` (0 = broadest), and a short
-description.
+`"computational social science"`) to `/topics?search=...`. OpenAlex returns up to
+10 candidates, each with `display_name`, `description`, `keywords`, and the
+hierarchy `domain > field > subfield`.
 
-We then ask Claude to pick the best 1–2 ([prompts/pick_concepts.txt](../scholarapp/prompts/pick_concepts.txt)).
+We then ask Claude to pick the best 1–2 ([prompts/pick_topics.txt](../scholarapp/prompts/pick_topics.txt)).
 Why use an LLM here at all?
 
-- **Ambiguity.** "neuroscience" matches "Neuroscience" (L0), "Computational
-  neuroscience" (L2), "Cognitive neuroscience" (L2), and others. The right answer
-  is often "both Neuroscience and Computational neuroscience" — we want them merged
-  with an OR filter so the author pool stays interdisciplinary.
-- **Level pick.** "biology" → L0 (broad) is fine; "computer vision" → L2 (specific)
-  is much better than the L0 "Computer science" parent. A heuristic isn't quite as
-  good as a model that reads the descriptions.
+- **Topics are narrow.** Each OpenAlex topic is one cluster of related papers — there
+  are ~4,500 of them. A search for "neuroscience" returns topics like "Neuroscience
+  and Neuropharmacology Research", "Neuroscience and Neural Engineering", etc. A
+  bare keyword match is not enough to pick well.
+- **The hierarchy is the strongest signal.** Two topics named "Neural Computation"
+  might sit in field=Neuroscience or field=Computer Science. The LLM uses the
+  `field`/`subfield` columns to keep picks coherent with the user's intent.
+- **Breadth vs. precision.** "neuroscience" usually wants both cellular/molecular and
+  cognitive/systems neuro; "computer vision" usually wants a single tight topic.
+  The LLM is told to pick 1 when one clearly dominates, 2 when the user's term spans
+  two sub-areas.
 - **Robust to typos / synonyms.** "ML" → "Machine learning"; "AI" → both AI and ML.
 
-The LLM is constrained to pick from the IDs we passed in (`select_concepts` tool
-with a `concept_ids` field; we additionally filter out any returned IDs we didn't
-provide, as a defense against hallucination).
+The LLM is constrained to pick from the IDs we passed in (`select_topics` tool with
+a `topic_ids` field; we additionally filter out any returned IDs we didn't provide,
+as a defense against hallucination).
 
 ## Over-fetch then filter
 
@@ -211,8 +218,11 @@ worse than false negatives (losing a legitimate candidate).
   discovery run uses `count * 3` Tavily requests (one per candidate). A 10-person
   run = 30 requests. You can do ~30 runs/month on the free tier.
 - **Anthropic** is governed by your account's RPM/TPM. Each run does 1
-  `_llm_pick_concepts` call + `count * 3` `_llm_extract_email` calls (one per
-  candidate). For a 10-person run that's ~31 small Claude calls. Negligible cost.
+  `_llm_pick_topics` call + `count * 3` `_llm_extract_email` calls (one per
+  candidate). For a 10-person run that's ~31 calls. **Both helpers use
+  `claude-haiku-4-5`** (constant `discovery.MODEL_HAIKU`) — they're narrow
+  extraction tasks where Haiku performs at parity with Sonnet for ~⅓ the cost.
+  A 3-professor run lands at ~$0.025 of Claude spend.
 - The `_request_with_retry` helper retries 429 + 5xx with exponential backoff (1s,
   2s, 4s) and honors `Retry-After`. Three attempts max; the third failure raises.
 
@@ -220,9 +230,9 @@ worse than false negatives (losing a legitimate candidate).
 
 | What you see | Cause | What to do |
 |---|---|---|
-| `OpenAlex returned no concepts for field 'comp neuro'` | Field is too colloquial | Try the standard term: `"computational neuroscience"` |
-| `Could not match field 'X' to an OpenAlex concept` | Concepts found but LLM rejected all | The pick prompt got too strict — try a synonym, or relax the prompt |
-| `OpenAlex returned no authors for field 'X'` | Concept matched but no qualifying authors | Concept is too narrow / too new; broaden the field |
+| `OpenAlex returned no topics for field 'comp neuro'` | Field is too colloquial | Try the standard term: `"computational neuroscience"` |
+| `Could not match field 'X' to an OpenAlex topic` | Topics found but LLM rejected all | The pick prompt got too strict — try a synonym, or relax the prompt |
+| `OpenAlex returned no authors for field 'X'` | Topic matched but no qualifying authors | Topic is too narrow / too new; broaden the field |
 | `Wanted N professors but only M survived...` | Email resolution drop rate higher than expected | Either accept M, raise OVERFETCH_MULTIPLIER, or improve the Tavily query |
 | `ANTHROPIC_API_KEY is not set` / `TAVILY_API_KEY is not set` | Missing env var | Add to `.env` |
 | Retried HTTP 429/503 still failing | Upstream actually unavailable | Wait + retry the run; OpenAlex/Tavily status pages |
@@ -232,11 +242,12 @@ and rendered as `Error: <message>`.
 
 ## What to do when the field is too narrow or too broad
 
-**Too narrow** (`/concepts` returns 0 or only L4–L5 concepts with no authors):
+**Too narrow** (`/topics` returns 0 results, or all candidates' `field` is unrelated):
 
-- The LLM picks an over-specific concept. Either rename the field to the parent
-  ("microscopy" instead of "two-photon microscopy"), or temporarily edit
-  `prompts/pick_concepts.txt` to bias toward higher-level concepts.
+- The user's term is too colloquial or too specific. Either rename the field to a
+  more standard form ("microscopy" instead of "two-photon microscopy"), or edit
+  `prompts/pick_topics.txt` to be more forgiving when a candidate's `field` partially
+  matches.
 
 **Too broad** (e.g., user types "biology" and we get 50,000 authors):
 
@@ -244,9 +255,10 @@ and rendered as `Error: <message>`.
   citations, so the breadth doesn't blow up costs — but the relevance to the user's
   interests likely will. The matching step (Step 5) will drop most of them, leading
   to many empty drafts.
-- Mitigation: in the prompt for `pick_concepts.txt`, the instructions already
-  prefer mid-level concepts to broad ones. If the user *really* wants "biology" the
-  L0 concept is honored, but the downstream pipeline will trim.
+- Mitigation: `pick_topics.txt` already steers Claude toward topics whose `field`
+  matches the user's phrasing (vs. broader siblings). If the user genuinely wants
+  "biology" we still pick a topic in field=Biology, but downstream matching will
+  trim.
 
 ## Extension points
 

@@ -118,8 +118,13 @@ Notes:
 - We don't extract text ourselves — no `pdfplumber`/`pypdf` dependency. Claude handles
   it.
 - The PDF must be ≤ 32 MB and ≤ 100 pages (model limits). Resumes are well under both.
-- We use `claude-sonnet-4-6` (constant `ingestion.MODEL`). The drafting and matching
-  steps will likely use the same model for cost reasons.
+- **Model split:** `parse_resume` uses `claude-sonnet-4-6` (constant
+  `ingestion.MODEL_SONNET`) because PDF accuracy on multi-column resumes is
+  materially better on Sonnet. `parse_prompt` uses `claude-haiku-4-5` (constant
+  `ingestion.MODEL_HAIKU`) — pulling four fields out of a paragraph is a narrow
+  task Haiku handles at parity for ~⅓ the cost. The same Sonnet/Haiku split is
+  applied in [discovery](04-discovery.md) and will be used by drafting (Step 6,
+  Sonnet for quality).
 
 For structured output we use **forced tool use**: Claude must call the
 `extract_resume` (or `extract_prompt`) tool, whose `input_schema` is the Pydantic

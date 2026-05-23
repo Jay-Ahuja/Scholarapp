@@ -25,3 +25,6 @@ venv/
 
 # Scholarapp local data (in case anyone symlinks ~/.scholarapp into the repo)
 .scholarapp/
+
+# Per-user inputs (resume, prompt, template) — keep out of git
+inputs/

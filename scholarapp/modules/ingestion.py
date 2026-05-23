@@ -26,7 +26,12 @@ from pydantic import BaseModel, Field, ValidationError
 from scholarapp.config import load_settings
 from scholarapp.errors import ConfigError, IngestionError
 
-MODEL = "claude-sonnet-4-6"
+# Model tiers. Sonnet for tasks where quality materially matters (PDF parsing,
+# email drafting); Haiku for narrow extraction/classification calls. See
+# docs/03-ingestion.md and docs/04-discovery.md for the per-call rationale.
+MODEL_SONNET = "claude-sonnet-4-6"
+MODEL_HAIKU = "claude-haiku-4-5"
+
 MAX_TOKENS_RESUME = 4096
 MAX_TOKENS_PROMPT = 1024
 
@@ -144,7 +149,7 @@ def parse_resume(pdf_path: Path) -> ResumeData:
 
     try:
         response = client.messages.create(
-            model=MODEL,
+            model=MODEL_SONNET,
             max_tokens=MAX_TOKENS_RESUME,
             system=[
                 {
@@ -206,7 +211,7 @@ def parse_prompt(text: str) -> PromptData:
 
     try:
         response = client.messages.create(
-            model=MODEL,
+            model=MODEL_HAIKU,
             max_tokens=MAX_TOKENS_PROMPT,
             system=[
                 {

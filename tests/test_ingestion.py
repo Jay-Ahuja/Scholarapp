@@ -109,7 +109,7 @@ def test_parse_resume_sends_correct_request_shape(tmp_path, fake_client):
     assert kw is not None
 
     # Model + caching
-    assert kw["model"] == ingestion.MODEL
+    assert kw["model"] == ingestion.MODEL_SONNET
     assert isinstance(kw["system"], list)
     assert kw["system"][0]["cache_control"] == {"type": "ephemeral"}
     assert "resume" in kw["system"][0]["text"].lower()

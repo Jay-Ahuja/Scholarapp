@@ -5,7 +5,7 @@ We mock at two levels:
 - A `FakeAsyncClient` replaces `httpx.AsyncClient` and returns canned JSON keyed
   by (method, URL prefix). This verifies real HTTP request shape (filters, query
   string composition, etc.) without burning Tavily / OpenAlex quota.
-- The two LLM helpers (`_llm_pick_concepts`, `_llm_extract_email`) are
+- The two LLM helpers (`_llm_pick_topics`, `_llm_extract_email`) are
   monkeypatched directly so we never touch the Anthropic API.
 """
 
@@ -209,7 +209,7 @@ def mock_discovery_env(monkeypatch):
     async def _pick(_client, _field, candidates):
         return [discovery._short_id(candidates[0]["id"])]
 
-    monkeypatch.setattr(discovery, "_llm_pick_concepts", _pick)
+    monkeypatch.setattr(discovery, "_llm_pick_topics", _pick)
 
 
 def test_find_professors_returns_count_when_enough_emails(monkeypatch, mock_discovery_env):
@@ -230,7 +230,7 @@ def test_find_professors_returns_count_when_enough_emails(monkeypatch, mock_disc
     monkeypatch.setattr(discovery, "_llm_extract_email", _email)
 
     routes = {
-        ("GET", "https://api.openalex.org/concepts"): {
+        ("GET", "https://api.openalex.org/topics"): {
             "results": [{"id": "https://openalex.org/C42", "display_name": "Field", "level": 1}]
         },
         ("GET", "https://api.openalex.org/authors"): {
@@ -265,7 +265,7 @@ def test_find_professors_logs_when_no_email_found(monkeypatch, mock_discovery_en
     monkeypatch.setattr(discovery, "_llm_extract_email", _email)
 
     routes = {
-        ("GET", "https://api.openalex.org/concepts"): {
+        ("GET", "https://api.openalex.org/topics"): {
             "results": [{"id": "https://openalex.org/C1", "display_name": "F", "level": 1}]
         },
         ("GET", "https://api.openalex.org/authors"): {
@@ -288,20 +288,20 @@ def test_find_professors_logs_when_no_email_found(monkeypatch, mock_discovery_en
     assert any("only 0 survived" in rec.message for rec in caplog.records)
 
 
-def test_find_professors_raises_when_no_concepts(monkeypatch, mock_discovery_env):
+def test_find_professors_raises_when_no_topics(monkeypatch, mock_discovery_env):
     routes = {
-        ("GET", "https://api.openalex.org/concepts"): {"results": []},
+        ("GET", "https://api.openalex.org/topics"): {"results": []},
     }
     fake_http = FakeAsyncClient(routes)
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: fake_http)
 
-    with pytest.raises(DiscoveryError, match="no concepts"):
+    with pytest.raises(DiscoveryError, match="no topics"):
         asyncio.run(discovery.find_professors("zzzzz-bogus", count=1, user_interests=[]))
 
 
 def test_find_professors_raises_when_no_authors(monkeypatch, mock_discovery_env):
     routes = {
-        ("GET", "https://api.openalex.org/concepts"): {
+        ("GET", "https://api.openalex.org/topics"): {
             "results": [{"id": "https://openalex.org/C1", "display_name": "F", "level": 1}]
         },
         ("GET", "https://api.openalex.org/authors"): {"results": []},
