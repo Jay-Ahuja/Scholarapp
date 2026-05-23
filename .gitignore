@@ -1,0 +1,27 @@
+# Environment
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+build/
+dist/
+
+# Virtualenvs
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Scholarapp local data (in case anyone symlinks ~/.scholarapp into the repo)
+.scholarapp/

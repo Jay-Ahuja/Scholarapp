@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scholarapp"
+version = "0.1.0"
+description = "CLI that drafts personalized cold emails to professors."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Scholarapp" }]
+dependencies = [
+    "typer>=0.12",
+    "sqlalchemy>=2.0",
+    "anthropic>=0.40",
+    "httpx>=0.27",
+    "pydantic>=2.7",
+    "google-auth>=2.30",
+    "google-auth-oauthlib>=1.2",
+    "google-api-python-client>=2.130",
+    "python-dotenv>=1.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.5",
+]
+
+[project.scripts]
+scholar = "scholarapp.cli:app"
+
+[tool.setuptools]
+packages = [
+    "scholarapp",
+    "scholarapp.db",
+    "scholarapp.modules",
+    "scholarapp.prompts",
+]
+
+[tool.setuptools.package-data]
+"scholarapp.prompts" = ["*.txt"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
