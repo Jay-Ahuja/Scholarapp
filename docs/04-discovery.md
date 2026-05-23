@@ -1,0 +1,305 @@
+# 04 — Discovery
+
+Given a research field and a target count, discovery returns up to N professors at
+academic institutions with their recent works and a verified academic email. Implementation:
+[scholarapp/modules/discovery.py](../scholarapp/modules/discovery.py).
+
+```python
+async def find_professors(
+    field: str,
+    count: int,
+    user_interests: list[str],
+) -> list[ProfessorCandidate]
+```
+
+`user_interests` is accepted but not yet used — actual relevance ranking happens in
+Step 5 (matching). Today it's a forward-compatible knob for future "narrow the author
+pool by interest" logic.
+
+## Data-flow diagram
+
+```
+field (str) ──┐
+              ▼
+    ┌─────────────────────┐
+    │ GET /concepts       │  OpenAlex
+    │ ?search=<field>     │
+    └─────────┬───────────┘
+              │  candidates: [{id, display_name, level, description}, ...]
+              ▼
+    ┌─────────────────────┐
+    │ Claude: pick 1-2    │  prompts/pick_concepts.txt → _ConceptPick
+    └─────────┬───────────┘
+              │  concept_ids: [C42, ...]
+              ▼
+    ┌─────────────────────┐
+    │ GET /authors        │  filter=x_concepts.id:C42|C43,
+    │  &sort=cited_by     │         last_known_institutions.type:education,
+    │                     │         works_count:>10
+    └─────────┬───────────┘
+              │  ~3×count authors (over-fetch)
+              ▼
+    For each author, in parallel (semaphore=10):
+    ┌────────────────────────────┐       ┌────────────────────────────┐
+    │ GET /works                 │       │ POST tavily.com/search     │
+    │  ?filter=author.id:Axxx    │       │  "<name>" "<inst>" faculty │
+    │  &sort=publication_date    │       │   email                    │
+    └────────────┬───────────────┘       └─────────┬──────────────────┘
+                 │ recent_works                    │ search results
+                 ▼                                 ▼
+                                          ┌────────────────────────┐
+                                          │ Claude: extract email  │
+                                          │ prompts/extract_email  │
+                                          └─────────┬──────────────┘
+                                                    │
+                                                    ▼
+                                             email + faculty_page_url
+                          (or None — candidate gets dropped downstream)
+              ▼
+    Drop candidates where email fails the academic-TLD allowlist.
+    Take the first `count` survivors. Done.
+```
+
+## OpenAlex endpoints used
+
+All requests carry `User-Agent: Scholarapp/0.1 (mailto:scholarapp@example.com)` —
+OpenAlex routes mailto-identified clients into the "polite pool" with better rate
+limits.
+
+| Endpoint | What we ask | Filter / sort |
+|---|---|---|
+| `GET /concepts` | Candidate concept IDs for a free-text field | `?search={field}&per_page=10` |
+| `GET /authors` | Top-cited academic authors in those concepts | `?filter=x_concepts.id:{C…}\|{C…},last_known_institutions.type:education,works_count:>10&sort=cited_by_count:desc` |
+| `GET /works` | 5 most recent works per author | `?filter=author.id:{A…}&sort=publication_date:desc&per_page=5` |
+
+Reference docs:
+
+- Concepts entity: https://docs.openalex.org/api-entities/concepts
+- Authors filtering: https://docs.openalex.org/api-entities/authors/filter-authors
+- Works filtering: https://docs.openalex.org/api-entities/works/filter-works
+- Polite pool: https://docs.openalex.org/how-to-use-the-api/api-overview#the-polite-pool
+
+Concepts vs topics: OpenAlex is migrating from "concepts" to "topics." The concepts
+taxonomy still works and is the simpler match for free-text fields. If you switch to
+topics later, the filter becomes `topics.id:T…` and `/concepts` becomes `/topics`.
+
+## Why two sources (OpenAlex + Tavily) instead of one
+
+- **OpenAlex** has clean, queryable, structured data on authors, institutions, and
+  works. It's a real API, free, polite-pool friendly, and uses stable IDs.
+- **OpenAlex does not reliably expose contact email.** A small fraction of author
+  records have an email field, and even then it's often outdated or institutional
+  aliases.
+- **Tavily** is a search API designed for LLM consumption (it returns clean snippets,
+  not raw HTML). We use it as a lightweight "search the open web for the professor's
+  email" step, then let Claude pull the address out of the top results.
+- Alternatives we ruled out:
+  - **Scraping Google Scholar:** against ToS, fragile, gets rate-limited fast.
+  - **University faculty-page scraping:** every school has a different layout; the
+    LLM-via-Tavily path generalizes for free.
+  - **Apollo / Hunter:** commercial email-finders are accurate for industry
+    contacts but weak for academics, and have per-seat pricing we don't want.
+- Bottom line: OpenAlex for what's clean and structured; Tavily + LLM for the messy
+  bit (contact info). One source for each side of the problem.
+
+## Field → concept resolution
+
+We send the user's free-text field (e.g., `"neuroscience"`, `"robotics"`,
+`"computational social science"`) to `/concepts?search=...`. OpenAlex returns up to
+10 candidates, each with `display_name`, `level` (0 = broadest), and a short
+description.
+
+We then ask Claude to pick the best 1–2 ([prompts/pick_concepts.txt](../scholarapp/prompts/pick_concepts.txt)).
+Why use an LLM here at all?
+
+- **Ambiguity.** "neuroscience" matches "Neuroscience" (L0), "Computational
+  neuroscience" (L2), "Cognitive neuroscience" (L2), and others. The right answer
+  is often "both Neuroscience and Computational neuroscience" — we want them merged
+  with an OR filter so the author pool stays interdisciplinary.
+- **Level pick.** "biology" → L0 (broad) is fine; "computer vision" → L2 (specific)
+  is much better than the L0 "Computer science" parent. A heuristic isn't quite as
+  good as a model that reads the descriptions.
+- **Robust to typos / synonyms.** "ML" → "Machine learning"; "AI" → both AI and ML.
+
+The LLM is constrained to pick from the IDs we passed in (`select_concepts` tool
+with a `concept_ids` field; we additionally filter out any returned IDs we didn't
+provide, as a defense against hallucination).
+
+## Over-fetch then filter
+
+We fetch `count * 3` authors from `/authors` and try to enrich every one in
+parallel. Why over-fetch?
+
+- **~20–30% of candidates lose email** in the Tavily + LLM step (no faculty page
+  surfaced; results are in PDFs not crawled; email obfuscated as "name [at] mit
+  [dot] edu"; etc.).
+- Without over-fetching, a 10-professor run regularly comes back with 6–7.
+- 3x is a starting point; if we see consistently higher drop rates, raise to 4x or
+  add a second Tavily query pattern. The constant lives at
+  `discovery.OVERFETCH_MULTIPLIER`.
+
+If fewer than `count` survive, `find_professors` logs a warning and returns what
+we have rather than failing — partial results are still useful.
+
+## Tavily query construction
+
+Current query:
+
+```
+"<professor name>" "<institution>" faculty email
+```
+
+Notes on the pattern:
+
+- Double-quoting both name and institution forces exact-phrase matching — without
+  quotes Tavily often returns pages about other people who share a surname.
+- "faculty email" steers toward directory and personal pages; it's a small loss for
+  professors whose page doesn't say "faculty" but a big win on average.
+
+Alternatives considered and not used:
+
+- `"<name>" "<institution>" CV` — surfaces academic CVs but often without email.
+- `<name> <institution> site:.edu` — site-restricted searches sometimes miss the
+  professor's actual department (e.g., adjuncts at hospitals).
+- Constructing the email pattern from the name and guessing
+  (`first.last@university.edu`): plausible but produces silent failures — we'd
+  email the wrong person. The Tavily + Claude pipeline only returns an address it
+  actually saw on a page.
+
+If a professor needs a second pass, the natural extension is to add a fallback
+query (`"<name>" <institution> "@" .edu`) and concatenate results — the
+`_resolve_email` function is a single place to add that.
+
+## Email validation: the academic-TLD allowlist
+
+In [scholarapp/modules/discovery.py](../scholarapp/modules/discovery.py):
+
+```python
+ACADEMIC_EMAIL_SUFFIXES = (
+    ".edu",
+    ".edu.au", ".edu.cn", ".edu.hk", ".edu.sg", ".edu.tw",
+    ".ac.at", ".ac.be", ".ac.cn", ".ac.il", ".ac.in",
+    ".ac.jp", ".ac.kr", ".ac.nz", ".ac.uk", ".ac.za",
+)
+```
+
+A candidate's email is dropped if its domain does not end in one of these suffixes.
+This is enforced both by the `is_academic_email` filter in `find_professors` and
+by a `field_validator` on `ProfessorCandidate.email`, so any bypass attempt would
+fail Pydantic validation.
+
+**Known gap:** continental Europe doesn't use a unified academic suffix.
+`uni-heidelberg.de`, `ethz.ch`, `polytechnique.fr` are all legitimate but don't end
+in `.edu` or `.ac.*`. To extend:
+
+1. Add the country's TLD or a known per-institution suffix to
+   `ACADEMIC_EMAIL_SUFFIXES`.
+2. If the country uses bare ccTLDs (`.de`, `.fr`) for universities, a TLD-only
+   allowlist is too coarse — switch to an institution-domain allowlist instead
+   (load a list from `data/academic_domains.txt`).
+3. Re-run the unit test `test_is_academic_email` with new parametrize cases.
+
+This is intentionally conservative — false positives (emailing a non-academic) are
+worse than false negatives (losing a legitimate candidate).
+
+## Rate-limit notes
+
+- **OpenAlex** has no published per-day limit for polite-pool users, but it
+  recommends keeping concurrent requests modest. Our `CONCURRENCY = 10` semaphore
+  is well below anything they'll throttle.
+- **Tavily free tier** is around 1,000 requests/month at the time of writing. Each
+  discovery run uses `count * 3` Tavily requests (one per candidate). A 10-person
+  run = 30 requests. You can do ~30 runs/month on the free tier.
+- **Anthropic** is governed by your account's RPM/TPM. Each run does 1
+  `_llm_pick_concepts` call + `count * 3` `_llm_extract_email` calls (one per
+  candidate). For a 10-person run that's ~31 small Claude calls. Negligible cost.
+- The `_request_with_retry` helper retries 429 + 5xx with exponential backoff (1s,
+  2s, 4s) and honors `Retry-After`. Three attempts max; the third failure raises.
+
+## Failure modes
+
+| What you see | Cause | What to do |
+|---|---|---|
+| `OpenAlex returned no concepts for field 'comp neuro'` | Field is too colloquial | Try the standard term: `"computational neuroscience"` |
+| `Could not match field 'X' to an OpenAlex concept` | Concepts found but LLM rejected all | The pick prompt got too strict — try a synonym, or relax the prompt |
+| `OpenAlex returned no authors for field 'X'` | Concept matched but no qualifying authors | Concept is too narrow / too new; broaden the field |
+| `Wanted N professors but only M survived...` | Email resolution drop rate higher than expected | Either accept M, raise OVERFETCH_MULTIPLIER, or improve the Tavily query |
+| `ANTHROPIC_API_KEY is not set` / `TAVILY_API_KEY is not set` | Missing env var | Add to `.env` |
+| Retried HTTP 429/503 still failing | Upstream actually unavailable | Wait + retry the run; OpenAlex/Tavily status pages |
+
+All errors are `DiscoveryError` (subclass of `ScholarError`), caught by the CLI
+and rendered as `Error: <message>`.
+
+## What to do when the field is too narrow or too broad
+
+**Too narrow** (`/concepts` returns 0 or only L4–L5 concepts with no authors):
+
+- The LLM picks an over-specific concept. Either rename the field to the parent
+  ("microscopy" instead of "two-photon microscopy"), or temporarily edit
+  `prompts/pick_concepts.txt` to bias toward higher-level concepts.
+
+**Too broad** (e.g., user types "biology" and we get 50,000 authors):
+
+- `/authors?sort=cited_by_count:desc&per_page=N` already returns the top N by
+  citations, so the breadth doesn't blow up costs — but the relevance to the user's
+  interests likely will. The matching step (Step 5) will drop most of them, leading
+  to many empty drafts.
+- Mitigation: in the prompt for `pick_concepts.txt`, the instructions already
+  prefer mid-level concepts to broad ones. If the user *really* wants "biology" the
+  L0 concept is honored, but the downstream pipeline will trim.
+
+## Extension points
+
+To add a new academic data source (e.g., Semantic Scholar):
+
+1. Add a fetcher: `async def _list_authors_semantic_scholar(http, field, count)`
+   returning the same `dict` shape used by the OpenAlex path.
+2. In `find_professors`, after `_list_authors`, merge `_list_authors_semantic_scholar`
+   results, de-dupe by name + institution.
+3. Update `docs/04-discovery.md` (this file) and add tests with fixture JSON for
+   the new source's response shape.
+4. New env var for any API key needed; add to `config.py` and `.env.example`.
+
+To swap Tavily for a different search provider:
+
+1. Add a `_brave_search` (or whatever) function with the same signature as
+   `_tavily_search` — `(http, key, query) -> list[dict]` with at least `title`,
+   `url`, `content` fields.
+2. Replace the call in `_resolve_email`. Or, for A/B testing, race both with
+   `asyncio.gather` and merge.
+
+## Local testing without API quota
+
+Unit tests use a `FakeAsyncClient` that returns canned JSON keyed by `(method, url
+prefix)`. The two Claude helpers are monkeypatched directly. No real API calls.
+
+```bash
+pytest tests/test_discovery.py -v
+```
+
+To exercise the full path against real APIs (Step 9 will set this up properly via
+cassettes), set both `.env` keys and run:
+
+```bash
+scholar run --inputs inputs/
+```
+
+This will:
+
+1. Parse the inputs as in Step 3
+2. Update the Run status to `discovering`
+3. Fan out to OpenAlex + Tavily + Claude
+4. Persist `Professor` + `Project` rows
+5. Update the Run status to `matching`
+6. Print `Discovered N professors. run_id=<uuid>`
+
+You can then inspect the rows:
+
+```bash
+scholar status <run_id>
+sqlite3 ~/.scholarapp/scholar.db \
+    'select name, institution, email from professors where run_id="<uuid>";'
+```
+
+Note: a real run costs a handful of Tavily quota and a few cents of Claude usage.
+Don't loop it on accident.

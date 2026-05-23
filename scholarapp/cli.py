@@ -10,16 +10,26 @@ prints "Not yet implemented".
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import shutil
+import sys
 from pathlib import Path
 
 import typer
 
 from scholarapp.config import load_settings
 from scholarapp.db import repo
+from scholarapp.db.models import RunStatus
 from scholarapp.db.session import get_session
 from scholarapp.errors import IngestionError, NotFoundError, ScholarError
-from scholarapp.modules import ingestion
+from scholarapp.modules import discovery, ingestion
+
+logging.basicConfig(
+    level=logging.WARNING,
+    format="%(levelname)s: %(message)s",
+    stream=sys.stderr,
+)
 
 app = typer.Typer(
     name="scholar",
@@ -77,7 +87,7 @@ def run(
         help="Directory containing resume.pdf, prompt.md, and template.md.",
     ),
 ) -> None:
-    """Parse inputs and create a Run row. (Discovery + later stages land in Steps 4-6.)"""
+    """Parse inputs, discover professors with verified emails, persist them. (Matching + drafting land in Steps 5-6.)"""
 
     def _impl() -> None:
         settings = load_settings()
@@ -127,6 +137,53 @@ def run(
             run_id = run_row.id
 
         typer.echo(f"Parsed inputs. run_id={run_id}")
+
+        # --- Step 4: discovery -------------------------------------------------
+        with get_session() as session:
+            repo.update_run_status(session, run_id, RunStatus.DISCOVERING)
+
+        typer.echo(
+            f"Discovering up to {prompt_data.count} professors in {prompt_data.field!r}..."
+        )
+        try:
+            candidates = asyncio.run(
+                discovery.find_professors(
+                    field=prompt_data.field,
+                    count=prompt_data.count,
+                    user_interests=resume_data.interests,
+                )
+            )
+        except ScholarError as e:
+            with get_session() as session:
+                repo.update_run_status(
+                    session, run_id, RunStatus.FAILED, error=f"discovery failed: {e}"
+                )
+            raise
+
+        with get_session() as session:
+            for c in candidates:
+                prof = repo.add_professor(
+                    session,
+                    run_id=run_id,
+                    name=c.name,
+                    institution=c.institution,
+                    email=c.email,
+                    openalex_id=c.openalex_id,
+                    faculty_page_url=c.faculty_page_url,
+                )
+                for w in c.recent_works:
+                    repo.add_project(
+                        session,
+                        professor_id=prof.id,
+                        title=w.title,
+                        url=w.url,
+                        year=w.year,
+                        abstract=w.abstract,
+                        raw_json={"openalex_id": w.openalex_id},
+                    )
+            repo.update_run_status(session, run_id, RunStatus.MATCHING)
+
+        typer.echo(f"Discovered {len(candidates)} professors. run_id={run_id}")
 
     _run_safely(_impl)
 
