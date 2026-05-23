@@ -21,6 +21,7 @@ from scholarapp.db.models import (
     MatchedProject,
     Professor,
     Project,
+    ResumeCache,
     Run,
     RunStatus,
     SendLog,
@@ -252,3 +253,19 @@ def add_send_log(
 def list_send_logs_for_draft(session: Session, draft_id: str) -> list[SendLog]:
     stmt = select(SendLog).where(SendLog.draft_id == draft_id)
     return list(session.scalars(stmt))
+
+
+# ---------------------------------------------------------------------------
+# ResumeCache — content-hash lookup for parsed resumes
+# ---------------------------------------------------------------------------
+
+
+def get_cached_resume(session: Session, sha256: str) -> dict | None:
+    """Return the cached parsed-resume JSON for this content hash, or None."""
+    row = session.get(ResumeCache, sha256)
+    return row.parsed_json if row else None
+
+
+def cache_resume(session: Session, sha256: str, parsed_json: dict) -> None:
+    """Insert-or-replace the parsed resume keyed by content hash."""
+    session.merge(ResumeCache(sha256=sha256, parsed_json=parsed_json))

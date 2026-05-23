@@ -266,3 +266,61 @@ def test_parse_prompt_raises_on_count_out_of_range(fake_client):
 def test_parse_prompt_raises_on_empty_text():
     with pytest.raises(IngestionError, match="empty"):
         parse_prompt("   ")
+
+
+# ---------------------------------------------------------------------------
+# Resume parse cache (lives in cli._parse_resume_cached)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def isolated_db(tmp_path, monkeypatch):
+    """Point DATA_DIR at tmp_path and reset SQLAlchemy state.
+
+    Without reset_engine() the test sees an engine bound to whichever DATA_DIR
+    was active at first import — typically the user's real ~/.scholarapp/.
+    """
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    from scholarapp.db import session as db_session
+
+    db_session.reset_engine()
+    yield tmp_path
+    db_session.reset_engine()
+
+
+def test_resume_cache_miss_then_hit(tmp_path, isolated_db, fake_client):
+    """First call: parse_resume runs. Second call with same bytes: cache hit, no Claude call."""
+    from scholarapp.cli import _parse_resume_cached
+
+    pdf = tmp_path / "resume.pdf"
+    pdf.write_bytes(b"%PDF-1.4\nbytes for hash A")
+    client = fake_client(_mock_response("extract_resume", _VALID_RESUME_INPUT))
+
+    # First call: cache miss → Claude call → cache write.
+    r1 = _parse_resume_cached(pdf)
+    assert r1.name == "Jane Doe"
+    assert client.messages.last_kwargs is not None
+
+    # Reset the call recorder; if a second call happens, last_kwargs will repopulate.
+    client.messages.last_kwargs = None
+    r2 = _parse_resume_cached(pdf)
+    assert r2.name == "Jane Doe"
+    assert client.messages.last_kwargs is None  # cache hit — no Claude call
+
+
+def test_resume_cache_invalidates_on_byte_change(tmp_path, isolated_db, fake_client):
+    """Editing the PDF by even one byte changes the hash, forcing a re-parse."""
+    from scholarapp.cli import _parse_resume_cached
+
+    pdf = tmp_path / "resume.pdf"
+    pdf.write_bytes(b"%PDF-1.4\nversion 1")
+    client = fake_client(_mock_response("extract_resume", _VALID_RESUME_INPUT))
+
+    _parse_resume_cached(pdf)
+    assert client.messages.last_kwargs is not None
+
+    # Change one byte → different hash → cache miss → Claude called again.
+    pdf.write_bytes(b"%PDF-1.4\nversion 2")
+    client.messages.last_kwargs = None
+    _parse_resume_cached(pdf)
+    assert client.messages.last_kwargs is not None

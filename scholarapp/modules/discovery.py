@@ -33,6 +33,7 @@ import anthropic
 import httpx
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
+from scholarapp import usage as usage_tracker
 from scholarapp.config import load_settings
 from scholarapp.errors import ConfigError, DiscoveryError
 
@@ -268,6 +269,7 @@ async def _llm_pick_topics(
         tool_choice={"type": "tool", "name": "select_topics"},
         messages=[{"role": "user", "content": user_text}],
     )
+    usage_tracker.record("pick_topics", MODEL_HAIKU, getattr(response, "usage", None))
     raw = _extract_tool_input(response, "select_topics")
     try:
         pick = _TopicPick.model_validate(raw)
@@ -309,6 +311,7 @@ async def _llm_extract_email(
         tool_choice={"type": "tool", "name": "extract_email"},
         messages=[{"role": "user", "content": user_text}],
     )
+    usage_tracker.record("extract_email", MODEL_HAIKU, getattr(response, "usage", None))
     raw = _extract_tool_input(response, "extract_email")
     try:
         return _EmailExtraction.model_validate(raw)

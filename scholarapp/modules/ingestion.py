@@ -23,6 +23,7 @@ from typing import Any
 import anthropic
 from pydantic import BaseModel, Field, ValidationError
 
+from scholarapp import usage as usage_tracker
 from scholarapp.config import load_settings
 from scholarapp.errors import ConfigError, IngestionError
 
@@ -183,6 +184,7 @@ def parse_resume(pdf_path: Path) -> ResumeData:
     except anthropic.APIError as e:
         raise IngestionError(f"Anthropic API error while parsing resume: {e}") from e
 
+    usage_tracker.record("parse_resume", MODEL_SONNET, getattr(response, "usage", None))
     tool_input = _extract_tool_input(response, "extract_resume")
     try:
         return ResumeData.model_validate(tool_input)
@@ -227,6 +229,7 @@ def parse_prompt(text: str) -> PromptData:
     except anthropic.APIError as e:
         raise IngestionError(f"Anthropic API error while parsing prompt: {e}") from e
 
+    usage_tracker.record("parse_prompt", MODEL_HAIKU, getattr(response, "usage", None))
     tool_input = _extract_tool_input(response, "extract_prompt")
     try:
         extracted = _PromptExtraction.model_validate(tool_input)

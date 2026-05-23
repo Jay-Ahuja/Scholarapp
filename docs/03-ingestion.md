@@ -160,6 +160,46 @@ Expected savings once it engages: subsequent calls within ~5 min reuse the cache
 prefix and pay ~10% of normal input cost on those tokens. For a 10-professor run,
 the drafting step alone reuses one ~2k-token system prompt 10 times — meaningful.
 
+## Resume parse cache (content-hash)
+
+`parse_resume` is the most expensive call per run (the Sonnet PDF call). Across
+multiple runs with the same résumé, re-parsing is wasteful — the bytes are
+identical, so the parsed fields will be too.
+
+The CLI helper [`_parse_resume_cached`](../scholarapp/cli.py) sits in front of
+`parse_resume` and memoizes by `sha256(pdf_bytes)`:
+
+```python
+def _parse_resume_cached(pdf_path: Path) -> ResumeData:
+    sha = hashlib.sha256(pdf_path.read_bytes()).hexdigest()
+    with get_session() as session:
+        cached = repo.get_cached_resume(session, sha)
+    if cached is not None:
+        return ResumeData.model_validate(cached)
+    data = parse_resume(pdf_path)
+    with get_session() as session:
+        repo.cache_resume(session, sha, data.model_dump())
+    return data
+```
+
+The cache lives in the `resume_cache` SQLite table (see
+[docs/02-persistence.md](02-persistence.md)). One row per unique PDF content
+hash. The hash IS the validity check — no invalidation logic needed. Edit the
+PDF by one byte and the hash changes, so we re-parse automatically.
+
+Effect on the cost formula:
+
+- **First time** you run with a new resume: pays the ~$0.015 Sonnet PDF parse,
+  then caches.
+- **Every subsequent run with the same PDF**: free for the resume parse step.
+  The fixed term in the cost formula drops from ~$0.02 to ~$0.005.
+
+To clear the cache (e.g., to re-run extraction after a prompt-template change):
+
+```bash
+sqlite3 ~/.scholarapp/scholar.db 'delete from resume_cache;'
+```
+
 ## Failure modes
 
 | Symptom | Cause | What the user sees | How to recover |

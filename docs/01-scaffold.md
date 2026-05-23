@@ -187,6 +187,39 @@ These apply to every step. When adding code in later steps, follow them.
 6. **One settings load per command.** Call `config.load_settings()` at the top of the command body; pass `Settings` down. No module-level singletons that capture env state at import time.
 7. **`DATA_DIR` is the only writable directory outside the repo.** Tests must override it (typically via `tmp_path`) so they don't pollute the user's real `~/.scholarapp/`.
 
+## Cost observability
+
+Every `scholar run` prints a per-call token + cost summary when the pipeline
+finishes (success or failure). Example:
+
+```
+────────────────────────────────────────────────────────────────
+  Claude usage
+────────────────────────────────────────────────────────────────
+  parse_resume           sonnet  in=  4823  cache=    0  out=  512  $0.0220
+  parse_prompt           haiku   in=   812  cache=    0  out=   98  $0.0013
+  pick_topics            haiku   in=  1456  cache=    0  out=   89  $0.0019
+  extract_email × 9      haiku   in= 14580  cache=    0  out= 1500  $0.0220
+────────────────────────────────────────────────────────────────
+  Total: $0.0472   (Sonnet $0.0220, Haiku $0.0252)
+────────────────────────────────────────────────────────────────
+```
+
+Implementation: [scholarapp/usage.py](../scholarapp/usage.py). Each Claude-calling
+function records its `response.usage` against a `UsageTracker` held in a
+`contextvars.ContextVar`. The CLI installs the tracker before running the pipeline
+and prints the formatted summary in a `finally` so you see the spend even when the
+run fails. The tracker is silent — `record()` is a no-op when no tracker is
+installed (i.e., during unit tests that don't care).
+
+Pricing table lives at `scholarapp.usage.PRICING`. Update if Anthropic publishes
+new rates; the figures are estimates, not ground truth. The Anthropic console is
+the authoritative source for billing.
+
+If a row is missing from your summary, that call wasn't made (cache hit, branch
+short-circuit). For example, a re-run with the same resume PDF hits the resume
+cache and produces no `parse_resume` row.
+
 ## What ships in Step 1
 
 - The full file/directory skeleton above.

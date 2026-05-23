@@ -46,6 +46,14 @@ Single-user SQLite database holding everything Scholarapp learns during a run: t
 │ file_path?          │               └──────────────────────┘
 │ updated_at          │
 └─────────────────────┘
+
+┌──────────────────────┐
+│ resume_cache         │  (standalone — no FKs)
+│──────────────────────│
+│ sha256 (PK)          │
+│ parsed_json          │
+│ cached_at            │
+└──────────────────────┘
 ```
 
 `?` denotes nullable. FK columns are indexed.
@@ -133,6 +141,17 @@ Populated by Step 8. One row per send *attempt*, including attempts that were in
 | `outcome` | `SendOutcome` — `sent`, `send_disabled`, or `error` |
 | `error` | Error message if `outcome=error` |
 | `gmail_message_id` | Gmail's returned message id if `outcome=sent` |
+
+### `ResumeCache` — `resume_cache`
+
+Content-hash memo of parsed resumes. Standalone (no FKs) — multiple Runs can hit
+the same cache entry. See [docs/03-ingestion.md](03-ingestion.md#resume-parse-cache-content-hash).
+
+| Field | Meaning |
+|---|---|
+| `sha256` | SHA-256 of the PDF bytes, primary key |
+| `parsed_json` | The `ResumeData` JSON; rebuilt via `ResumeData.model_validate(...)` on hit |
+| `cached_at` | When the entry was written; informational only — there's no TTL |
 
 ## Status enums and lifecycles
 

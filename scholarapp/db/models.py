@@ -180,3 +180,18 @@ class SendLog(Base):
     outcome: Mapped[SendOutcome] = mapped_column(_enum_col(SendOutcome))
     error: Mapped[str | None] = mapped_column(Text)
     gmail_message_id: Mapped[str | None]
+
+
+class ResumeCache(Base):
+    """Content-hash cache for parsed resumes.
+
+    Keyed by SHA-256 of the PDF bytes. Hit when the same PDF (byte-for-byte
+    identical) was parsed in a previous run — skips a Sonnet call worth ~$0.015.
+    No invalidation logic needed; the hash IS the validity check.
+    """
+
+    __tablename__ = "resume_cache"
+
+    sha256: Mapped[str] = mapped_column(primary_key=True)
+    parsed_json: Mapped[dict] = mapped_column(JSON)
+    cached_at: Mapped[datetime] = mapped_column(default=_utcnow)

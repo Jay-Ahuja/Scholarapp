@@ -11,6 +11,7 @@ prints "Not yet implemented".
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import shutil
 import sys
@@ -18,6 +19,7 @@ from pathlib import Path
 
 import typer
 
+from scholarapp import usage as usage_tracker
 from scholarapp.config import load_settings
 from scholarapp.db import repo
 from scholarapp.db.models import RunStatus
@@ -79,6 +81,25 @@ def init() -> None:
     _run_safely(_impl)
 
 
+def _parse_resume_cached(pdf_path: Path) -> ingestion.ResumeData:
+    """Resume parse, memoized by SHA-256 of the PDF bytes.
+
+    First call with a given PDF hits Claude (~$0.015 on Sonnet); every subsequent
+    call with the same bytes is free. Edit the resume by one byte and the hash
+    changes, so the cache invalidates automatically.
+    """
+    sha = hashlib.sha256(pdf_path.read_bytes()).hexdigest()
+    with get_session() as session:
+        cached = repo.get_cached_resume(session, sha)
+    if cached is not None:
+        typer.echo(f"Using cached resume parse (sha256={sha[:8]})")
+        return ingestion.ResumeData.model_validate(cached)
+    data = ingestion.parse_resume(pdf_path)
+    with get_session() as session:
+        repo.cache_resume(session, sha, data.model_dump())
+    return data
+
+
 @app.command("run")
 def run(
     inputs: Path = typer.Option(
@@ -90,6 +111,17 @@ def run(
     """Parse inputs, discover professors with verified emails, persist them. (Matching + drafting land in Steps 5-6.)"""
 
     def _impl() -> None:
+        tracker = usage_tracker.UsageTracker()
+        usage_tracker.set_tracker(tracker)
+        try:
+            _run_pipeline(tracker)
+        finally:
+            usage_tracker.set_tracker(None)
+            if tracker.records:
+                typer.echo("")
+                typer.echo(usage_tracker.summarize(tracker))
+
+    def _run_pipeline(tracker: usage_tracker.UsageTracker) -> None:
         settings = load_settings()
 
         resume_path = inputs / "resume.pdf"
@@ -103,7 +135,7 @@ def run(
                 )
 
         typer.echo(f"Parsing resume: {resume_path}")
-        resume_data = ingestion.parse_resume(resume_path)
+        resume_data = _parse_resume_cached(resume_path)
         typer.echo(f"Parsed resume for {resume_data.name}.")
 
         typer.echo(f"Parsing prompt: {prompt_path}")
