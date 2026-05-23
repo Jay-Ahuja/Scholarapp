@@ -166,7 +166,7 @@ Anything else (cache dirs, log levels, etc.) should be added here, not scattered
 | Command | Status | Purpose |
 |---|---|---|
 | `scholar init` | implemented | Creates `~/.scholarapp/` and writes `config.toml` if missing |
-| `scholar run` | stub | Future: end-to-end pipeline against `./inputs/` |
+| `scholar run` | partial | Parses resume + prompt and creates a Run row (added in Step 3); discovery + drafting still pending |
 | `scholar list` | implemented | Tabulates all runs (added in Step 2) |
 | `scholar review <run_id>` | stub | Future: write drafts to disk, open `$EDITOR` |
 | `scholar approve <run_id> [--only <slug>]` | stub | Future: mark drafts approved |
@@ -199,7 +199,7 @@ These apply to every step. When adding code in later steps, follow them.
 | Step | Doc | What it adds |
 |---|---|---|
 | 2 | [`02-persistence.md`](02-persistence.md) | SQLAlchemy models, `init_db()`, `scholar list` and `scholar status` reading the DB |
-| 3 | `03-ingestion.md` (to be written) | Resume + prompt parsing via Claude |
+| 3 | [`03-ingestion.md`](03-ingestion.md) | Resume + prompt parsing via Claude |
 | 4 | `04-discovery.md` (to be written) | OpenAlex + Tavily professor lookup |
 | 5 | `05-matching.md` (to be written) | Per-professor project relevance |
 | 6 | `06-drafting.md` (to be written) | Email drafting with prompt caching |

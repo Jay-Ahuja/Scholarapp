@@ -10,12 +10,16 @@ prints "Not yet implemented".
 
 from __future__ import annotations
 
+import shutil
+from pathlib import Path
+
 import typer
 
 from scholarapp.config import load_settings
 from scholarapp.db import repo
 from scholarapp.db.session import get_session
-from scholarapp.errors import NotFoundError, ScholarError
+from scholarapp.errors import IngestionError, NotFoundError, ScholarError
+from scholarapp.modules import ingestion
 
 app = typer.Typer(
     name="scholar",
@@ -66,9 +70,65 @@ def init() -> None:
 
 
 @app.command("run")
-def run() -> None:
-    """Run the full pipeline: parse inputs, discover, match, draft."""
-    _not_implemented("run")
+def run(
+    inputs: Path = typer.Option(
+        Path("./inputs"),
+        "--inputs",
+        help="Directory containing resume.pdf, prompt.md, and template.md.",
+    ),
+) -> None:
+    """Parse inputs and create a Run row. (Discovery + later stages land in Steps 4-6.)"""
+
+    def _impl() -> None:
+        settings = load_settings()
+
+        resume_path = inputs / "resume.pdf"
+        prompt_path = inputs / "prompt.md"
+        template_path = inputs / "template.md"
+        for required in (resume_path, prompt_path, template_path):
+            if not required.exists():
+                raise IngestionError(
+                    f"Missing input file: {required}. Expected resume.pdf, "
+                    "prompt.md, and template.md inside the --inputs directory."
+                )
+
+        typer.echo(f"Parsing resume: {resume_path}")
+        resume_data = ingestion.parse_resume(resume_path)
+        typer.echo(f"Parsed resume for {resume_data.name}.")
+
+        typer.echo(f"Parsing prompt: {prompt_path}")
+        prompt_data = ingestion.parse_prompt(prompt_path.read_text())
+        typer.echo(
+            f"Parsed prompt: field={prompt_data.field!r}, count={prompt_data.count}, "
+            f"goal={prompt_data.goal!r}"
+        )
+
+        template_text = template_path.read_text()
+
+        with get_session() as session:
+            run_row = repo.create_run(
+                session,
+                field=prompt_data.field,
+                goal=prompt_data.goal,
+                considerations=prompt_data.considerations,
+                count=prompt_data.count,
+                resume_path=str(resume_path.resolve()),
+                template_text=template_text,
+            )
+
+            run_inputs_dir = settings.runs_dir / run_row.id / "inputs"
+            run_inputs_dir.mkdir(parents=True, exist_ok=True)
+            copied_resume = run_inputs_dir / "resume.pdf"
+            shutil.copy2(resume_path, copied_resume)
+            shutil.copy2(prompt_path, run_inputs_dir / "prompt.md")
+            shutil.copy2(template_path, run_inputs_dir / "template.md")
+
+            run_row.resume_path = str(copied_resume.resolve())
+            run_id = run_row.id
+
+        typer.echo(f"Parsed inputs. run_id={run_id}")
+
+    _run_safely(_impl)
 
 
 @app.command("list")
