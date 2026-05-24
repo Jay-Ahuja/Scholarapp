@@ -98,26 +98,33 @@ caller raises as `MatchingError`.
 `MAX_PICKS = 3` is a module constant. Adjust if a future experiment shows
 otherwise.
 
-## Sonnet vs Haiku for matching
+## Model: Haiku (was Sonnet)
 
-Matching uses `claude-sonnet-4-6` (`MODEL_SONNET` in the module), unlike the other
-narrow-extraction tasks in the pipeline which run on Haiku. The reason:
+Matching uses `claude-haiku-4-5` (`MATCH_MODEL = MODEL_HAIKU` in the module).
+Originally Sonnet — the argument was that distinguishing **surface overlap**
+("both about neuroscience") from **real overlap** ("both use CNNs on MRI volumes")
+needed Sonnet's judgment. In practice:
 
-- The job is to distinguish **surface overlap** ("both about neuroscience") from
-  **real overlap** ("both use CNNs on MRI volumes"). That distinction is exactly
-  what smaller models flatten.
-- A bad match → a draft that talks about something the professor doesn't actually
-  work on → no reply. The downstream cost of being wrong is high.
+- The task is bounded: read 2–5 abstracts, pick 2–3 that overlap, write a
+  one-sentence rationale per pick. This is extract-and-justify, not deep
+  reasoning.
+- The prompt's hard constraints — "technical specifics over field-level overlap",
+  "do not invent overlap", "≤25 words naming the concrete overlap" — force
+  specificity regardless of model. Both Haiku and Sonnet hit the same output
+  shape; Haiku doesn't flatten in this regime.
 
-Cost per professor: ~$0.008 (1,500 input + 200 output tokens on Sonnet). For
-N=3 that's ~$0.024 added to the per-run total. The "cached re-run" cost (post
-resume cache, post Haiku switch on other calls) goes from ~$0.025 to ~$0.045 with
-Step 5 in the loop.
+Cost per professor: ~$0.003 (1,500 input + 200 output on Haiku) vs ~$0.008 on
+Sonnet. For N=3 that's ~$0.009 instead of ~$0.024 added to the per-run total —
+a ~$0.015 saving per run that scales with N.
 
-If quality holds, the model can be flipped by changing one constant
-(`matching.MODEL_SONNET`). The `usage` log will show whether the picks were good
-enough to justify the spend — re-running with Haiku and comparing the resulting
-emails is a worthwhile experiment.
+**Bonus:** keeping matching off Sonnet frees the entire Sonnet ITPM budget for
+drafting, which is the main 429 bottleneck on Anthropic Tier 1 accounts.
+
+**To swap back to Sonnet:** change `MATCH_MODEL = MODEL_HAIKU` to
+`MATCH_MODEL = MODEL_SONNET` in [matching.py](../scholarapp/modules/matching.py).
+One-line revert. If you suspect Haiku is picking weak hooks, run a comparison
+between two `DATA_DIR`s — same inputs, different `MATCH_MODEL` — and diff the
+resulting `why_relevant` strings.
 
 ## Tuning relevance — current state and alternatives
 

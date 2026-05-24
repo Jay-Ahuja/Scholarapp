@@ -165,7 +165,7 @@ def test_match_projects_sends_correct_request_shape(fake_client):
     asyncio.run(match_projects("Jane Doe", _PROJECTS, _INTERESTS, _EXPERIENCES))
     kw = client.messages.last_kwargs
     assert kw is not None
-    assert kw["model"] == matching.MODEL_SONNET
+    assert kw["model"] == matching.MATCH_MODEL
     assert kw["system"][0]["cache_control"] == {"type": "ephemeral"}
     assert "match" in kw["system"][0]["text"].lower()
     assert kw["tool_choice"] == {"type": "tool", "name": "select_matches"}

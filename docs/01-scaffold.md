@@ -158,6 +158,9 @@ All env vars are read in `scholarapp/config.py`. `.env` at the working directory
 | `SEND_ENABLED` | `false` | Step 8 — gates the Gmail send path |
 | `SEND_DAILY_CAP` | `20` | Step 8 — per-day cap once sending is enabled |
 | `DATA_DIR` | `~/.scholarapp` | Everywhere — root of all on-disk state |
+| `DRAFTS_DIR` | `<cwd>/drafts` | Step 7 — visible draft files (overrides DATA_DIR for drafts) |
+| `ANTHROPIC_CONCURRENCY` | `3` | Concurrent Anthropic calls per stage. Tier 1 safe; raise to 10+ after upgrading. |
+| `ANTHROPIC_MAX_RETRIES` | `5` | SDK retry attempts for 429 / 5xx / network. Honors Retry-After. |
 
 Anything else (cache dirs, log levels, etc.) should be added here, not scattered.
 
@@ -171,7 +174,7 @@ Anything else (cache dirs, log levels, etc.) should be added here, not scattered
 | `scholar review <run_id>` | implemented | Writes drafts to disk and opens `$EDITOR` (added in Step 7) |
 | `scholar approve <run_id> [--only <slug>]` | implemented | Sets `status: approved` in matching files, then syncs (added in Step 7) |
 | `scholar status <run_id>` | implemented | Per-draft status table for a run (added in Step 2) |
-| `scholar send <run_id>` | stub | Future: send approved drafts (gated) |
+| `scholar send <run_id>` | implemented (gated) | Sends approved drafts via Gmail; default `SEND_ENABLED=false` makes it a no-op + warning. See [docs/08](08-delivery.md). |
 
 Stubs print `Not yet implemented: <command>` and exit 0. The wiring exists so the CLI surface is stable from Step 1 onward.
 
@@ -186,6 +189,35 @@ These apply to every step. When adding code in later steps, follow them.
 5. **Prompts as `.txt` resources.** Templates go in `scholarapp/prompts/*.txt` and are loaded via `importlib.resources.files("scholarapp.prompts").joinpath("name.txt").read_text()`. This keeps prompts diffable and out of Python string literals.
 6. **One settings load per command.** Call `config.load_settings()` at the top of the command body; pass `Settings` down. No module-level singletons that capture env state at import time.
 7. **`DATA_DIR` is the only writable directory outside the repo.** Tests must override it (typically via `tmp_path`) so they don't pollute the user's real `~/.scholarapp/`.
+
+## Anthropic rate limits
+
+Anthropic accounts have tiered per-minute caps. **Tier 1** (default, no credits
+purchased) is very tight:
+
+| Limit | Tier 1 | Tier 2 (~$40 prepay) |
+|---|---:|---:|
+| Requests / minute | 50 | 1,000 |
+| Haiku input tokens / minute | 50,000 | 100,000 |
+| Sonnet input tokens / minute | 30,000 | 80,000 |
+
+With `ANTHROPIC_CONCURRENCY=3` (default) and Anthropic's built-in `Retry-After`-
+aware retries (`ANTHROPIC_MAX_RETRIES=5`), Tier 1 generally handles N≤10 cleanly.
+At N=20 you'll likely see 429s during `extract_email` (Haiku TPM ceiling) and/or
+`draft_email` (Sonnet TPM ceiling) — the runs still complete via SDK retries but
+take longer.
+
+If runs are failing or feeling slow:
+
+1. Lower N in `inputs/prompt.md` to 5–10.
+2. Upgrade your Anthropic account at https://console.anthropic.com/settings/billing
+   (one-time prepay puts you on Tier 2).
+3. After upgrading, set `ANTHROPIC_CONCURRENCY=10` in `.env`.
+
+Tavily has a separate **monthly** quota (free tier ~1000 req/month). When you
+hit Tavily 429, discovery aborts immediately with a clean error — there's no
+in-run retry because monthly quotas don't recover in seconds. See
+[docs/04-discovery.md](04-discovery.md).
 
 ## Cheap exploration: `scholar run --stop-after`
 
@@ -309,7 +341,7 @@ cache and produces no `parse_resume` row.
 | 5 | [`05-matching.md`](05-matching.md) | Per-professor project relevance |
 | 6 | [`06-drafting.md`](06-drafting.md) | Email drafting with prompt caching |
 | 7 | [`07-review.md`](07-review.md) | Editable markdown draft files |
-| 8 | `08-delivery.md` (to be written) | Gmail OAuth + the SEND_ENABLED gate |
+| 8 | [`08-delivery.md`](08-delivery.md) | Gmail OAuth + the SEND_ENABLED gate |
 | 9 | `09-smoke-test.md` (to be written) | End-to-end test + top-level README polish |
 
 The prompts to give an agent for each step live in [`implementation-prompts.md`](../implementation-prompts.md) at the repo root.

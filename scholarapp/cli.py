@@ -30,6 +30,7 @@ from scholarapp.db.models import DraftStatus, Project, RunStatus
 from scholarapp.db.session import get_session
 from scholarapp.errors import IngestionError, NotFoundError, ScholarError
 from scholarapp.modules import (
+    delivery,
     discovery,
     drafting,
     ingestion,
@@ -85,7 +86,7 @@ def _run_safely(fn, *args, **kwargs) -> None:
 
 @app.command("init")
 def init() -> None:
-    """Create the data directory and write a default config.toml if missing."""
+    """Create the data directory, write a default config.toml, run Gmail OAuth if ready."""
 
     def _impl() -> None:
         settings = load_settings()
@@ -96,6 +97,40 @@ def init() -> None:
         else:
             ui.info(f"[dim]Already exists:[/dim] {settings.config_path}")
         ui.info(f"Data directory: [bold]{settings.data_dir}[/bold]")
+
+        # Gmail OAuth setup — only run when client_secret.json is present.
+        # Step 8 — see docs/08-delivery.md for full setup.
+        ui.info("")
+        if settings.client_secret_path.exists():
+            if settings.credentials_path.exists():
+                ui.info(
+                    f"[dim]Gmail credentials already saved at {settings.credentials_path}[/dim]"
+                )
+            else:
+                ui.info("Found client_secret.json. Running Gmail OAuth flow...")
+                ui.info(
+                    "A browser tab will open. Authorize Scholarapp to send Gmail "
+                    "on your behalf."
+                )
+                try:
+                    delivery._oauth_flow()
+                    ui.info(
+                        f"[green]✓[/green] Saved credentials to "
+                        f"[bold]{settings.credentials_path}[/bold] (chmod 600)."
+                    )
+                except ScholarError as e:
+                    ui.error(str(e))
+                    # Don't exit non-zero — init's primary job (data dir) succeeded.
+        else:
+            ui.info("[bold]Gmail send is not yet authorized.[/bold] To enable:")
+            ui.info("  1. Create a Google Cloud project + enable the Gmail API")
+            ui.info("  2. Configure the OAuth consent screen (External, testing mode)")
+            ui.info("  3. Create OAuth credentials (type: Desktop app)")
+            ui.info(
+                f"  4. Download client_secret.json → place at [bold]{settings.client_secret_path}[/bold]"
+            )
+            ui.info("  5. Re-run [bold cyan]scholar init[/bold cyan]")
+            ui.info("  Full walkthrough: [bold]docs/08-delivery.md[/bold]")
 
     _run_safely(_impl)
 
@@ -539,9 +574,21 @@ def status(run_id: str = typer.Argument(..., help="Run ID to inspect.")) -> None
 
 
 @app.command("send")
-def send(run_id: str = typer.Argument(..., help="Run ID whose approved drafts to send.")) -> None:
-    """Send approved drafts (gated behind SEND_ENABLED)."""
-    _not_implemented("send")
+def send_cmd(
+    run_id: str = typer.Argument(..., help="Run ID whose approved drafts to send."),
+) -> None:
+    """Send approved drafts via Gmail. Gated behind SEND_ENABLED — see docs/08-delivery.md."""
+
+    def _impl() -> None:
+        try:
+            report = delivery.send_approved(run_id)
+        except delivery.SendingDisabled as e:
+            # Expected behavior when SEND_ENABLED=false. Yellow, not red — not an error.
+            ui.warn(str(e))
+            raise typer.Exit(code=1) from e
+        ui.delivery_report(report)
+
+    _run_safely(_impl)
 
 
 if __name__ == "__main__":

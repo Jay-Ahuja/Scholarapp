@@ -1,10 +1,17 @@
 """Step 5 — Matching: pick the 2-3 most relevant works per professor.
 
 Produces the "hook" that drafting (Step 6) uses to write a personalized email.
-The judgment is intentionally on Sonnet rather than Haiku because the prompt
-asks the model to distinguish surface keyword overlap ("both are neuroscience")
-from genuine technical overlap ("both use CNNs to segment MRI volumes") — that
-distinction is the whole point and smaller models flatten it.
+
+Model: Haiku. The task — read 2-5 abstracts, pick 2-3 with concrete technical
+overlap, write a one-sentence rationale per pick — is bounded extract-and-justify
+work. The prompt's hard constraints ("technical specifics over field-level
+overlap", "don't invent overlap", "≤25 words naming the concrete overlap") force
+specificity regardless of which model runs them. Haiku handles this at parity
+with Sonnet for ~⅓ the cost; we keep Sonnet for the actual email writing
+(drafting), where voice and cohesion matter.
+
+Bonus: keeping matching off Sonnet frees the entire Sonnet ITPM budget for
+drafting — which is the main 429 bottleneck on Tier 1 Anthropic accounts.
 
 Public entry points:
 
@@ -31,10 +38,15 @@ from scholarapp.errors import ConfigError, MatchingError
 
 logger = logging.getLogger(__name__)
 
-# Sonnet for the relevance judgment; see module docstring.
+# Both model constants kept for clarity / easy swap. See module docstring for
+# the choice rationale.
 MODEL_SONNET = "claude-sonnet-4-6"
+MODEL_HAIKU = "claude-haiku-4-5"
+# Active model for matching. Edit this one line to swap.
+MATCH_MODEL = MODEL_HAIKU
 MAX_TOKENS = 1024
-CONCURRENCY = 10
+# Default concurrency; overridden by settings.anthropic_concurrency at runtime.
+CONCURRENCY = 3
 MAX_PICKS = 3
 
 
@@ -81,7 +93,10 @@ def _get_anthropic_client() -> anthropic.AsyncAnthropic:
     settings = load_settings()
     if not settings.anthropic_api_key:
         raise ConfigError("ANTHROPIC_API_KEY is not set.")
-    return anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+    return anthropic.AsyncAnthropic(
+        api_key=settings.anthropic_api_key,
+        max_retries=settings.anthropic_max_retries,
+    )
 
 
 def _load_prompt(name: str) -> str:
@@ -153,7 +168,7 @@ async def match_projects(
 
     try:
         response = await client.messages.create(
-            model=MODEL_SONNET,
+            model=MATCH_MODEL,
             max_tokens=MAX_TOKENS,
             system=[
                 {"type": "text", "text": system_text, "cache_control": {"type": "ephemeral"}}
@@ -174,7 +189,7 @@ async def match_projects(
         ) from e
 
     usage_tracker.record(
-        "match_projects", MODEL_SONNET, getattr(response, "usage", None)
+        "match_projects", MATCH_MODEL, getattr(response, "usage", None)
     )
 
     raw = _extract_tool_input(response, "select_matches")
@@ -219,15 +234,21 @@ async def match_projects_for_run(
     user_interests: list[str],
     user_experiences: str,
     *,
-    concurrency: int = CONCURRENCY,
+    concurrency: int | None = None,
 ) -> list[list[MatchedProject]]:
     """Run `match_projects` over every (professor_name, projects) pair in parallel.
 
     Output is parallel to `pairs` — `result[i]` corresponds to `pairs[i]`. Use
     `zip(pairs, result)` to associate with the caller's professor records.
+
+    Concurrency defaults to `settings.anthropic_concurrency` (env-driven), with
+    the module constant `CONCURRENCY` as the fallback when caller passes None
+    explicitly. Lower this on Tier 1 Anthropic accounts to avoid 429s.
     """
+    settings = load_settings()
+    effective_concurrency = concurrency if concurrency is not None else settings.anthropic_concurrency
     client = _get_anthropic_client()
-    sem = asyncio.Semaphore(concurrency)
+    sem = asyncio.Semaphore(effective_concurrency)
 
     async def _bounded(name: str, projects: list[ProjectForMatching]) -> list[MatchedProject]:
         async with sem:

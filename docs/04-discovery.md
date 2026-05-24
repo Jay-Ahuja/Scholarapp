@@ -263,7 +263,14 @@ worse than false negatives (losing a legitimate candidate).
 | `OpenAlex returned no authors for field 'X'` | Topic matched but no qualifying authors | Topic is too narrow / too new; broaden the field |
 | `Wanted N professors but only M survived...` | Email resolution drop rate higher than expected | Either accept M, raise OVERFETCH_MULTIPLIER, or improve the Tavily query |
 | `ANTHROPIC_API_KEY is not set` / `TAVILY_API_KEY is not set` | Missing env var | Add to `.env` |
-| Retried HTTP 429/503 still failing | Upstream actually unavailable | Wait + retry the run; OpenAlex/Tavily status pages |
+| `Tavily returned 429 (rate limit / quota exhausted)...` | Monthly Tavily quota used up (free tier ~1000/month) | Wait until next billing cycle, lower the requested count, or upgrade. A run uses `count × 3` Tavily requests. |
+| Retried HTTP 429/503 still failing (OpenAlex) | Upstream actually unavailable | Wait + retry the run; check OpenAlex status |
+
+**Tavily rate-limit handling:** when Tavily returns 429 (almost always monthly
+quota exhausted), discovery aborts immediately rather than burning more requests.
+A module-level `asyncio.Event` circuit-breaks sibling fan-out tasks so the
+console doesn't flood with retry warnings — you'll see one clean error message
+and `scholar run` exits with code 1.
 
 All errors are `DiscoveryError` (subclass of `ScholarError`), caught by the CLI
 and rendered as `Error: <message>`.

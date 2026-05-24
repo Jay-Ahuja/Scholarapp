@@ -40,7 +40,8 @@ logger = logging.getLogger(__name__)
 
 MODEL_SONNET = "claude-sonnet-4-6"
 MAX_TOKENS = 1024
-CONCURRENCY = 10
+# Default concurrency; overridden by settings.anthropic_concurrency at runtime.
+CONCURRENCY = 3
 
 
 # ---------------------------------------------------------------------------
@@ -79,7 +80,10 @@ def _get_anthropic_client() -> anthropic.AsyncAnthropic:
     settings = load_settings()
     if not settings.anthropic_api_key:
         raise ConfigError("ANTHROPIC_API_KEY is not set.")
-    return anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+    return anthropic.AsyncAnthropic(
+        api_key=settings.anthropic_api_key,
+        max_retries=settings.anthropic_max_retries,
+    )
 
 
 def _load_prompt(name: str) -> str:
@@ -266,16 +270,22 @@ async def draft_emails_for_run(
     goal: str,
     considerations: str,
     *,
-    concurrency: int = CONCURRENCY,
+    concurrency: int | None = None,
 ) -> list[EmailDraft]:
     """Draft emails for every professor in parallel.
 
     Output is parallel to `requests` — `result[i]` corresponds to `requests[i]`.
     All requests must have non-empty `matched` (caller pre-checks); if any do,
     that draft call raises and the gather fails.
+
+    Concurrency defaults to `settings.anthropic_concurrency` (env-driven). On
+    Tier 1 Anthropic accounts the Sonnet 30k ITPM limit is the bottleneck —
+    keep concurrency at 2-3 to avoid 429s mid-run.
     """
+    settings = load_settings()
+    effective_concurrency = concurrency if concurrency is not None else settings.anthropic_concurrency
     client = _get_anthropic_client()
-    sem = asyncio.Semaphore(concurrency)
+    sem = asyncio.Semaphore(effective_concurrency)
 
     async def _bounded(req: DraftRequest) -> EmailDraft:
         async with sem:

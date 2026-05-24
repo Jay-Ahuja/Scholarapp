@@ -284,6 +284,29 @@ def render_usage_table(tracker: Any) -> None:
         console.print(f"  {breakdown}")
 
 
+def delivery_report(report: Any) -> None:
+    """Counts + optional error panel for `scholar send` output."""
+    sent_color = "green" if report.sent else "white"
+    err_color = "red" if report.errors else "white"
+    counts = (
+        f"attempted=[bold]{report.attempted}[/bold]  "
+        f"sent=[{sent_color}]{report.sent}[/{sent_color}]  "
+        f"send_disabled=[dim]{report.send_disabled}[/dim]  "
+        f"[{err_color}]errors={report.errors}[/{err_color}]"
+    )
+    console.print(counts)
+    if report.error_messages:
+        err_text = "\n".join(f"• {e}" for e in report.error_messages)
+        console.print(
+            Panel(
+                err_text,
+                title="[red]Errors[/red]",
+                border_style="red",
+                title_align="left",
+            )
+        )
+
+
 def sync_report_panel(report: Any) -> None:
     """Counts + optional warning/error panels for `scholar approve` output."""
     counts_color = "red" if report.errors else "white"

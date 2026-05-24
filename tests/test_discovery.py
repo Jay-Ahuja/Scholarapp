@@ -84,7 +84,14 @@ class _FakeResponse:
 
     def raise_for_status(self) -> None:
         if self.status_code >= 400:
-            raise httpx.HTTPError(f"status {self.status_code}")
+            # httpx.Response.raise_for_status raises HTTPStatusError, not the bare
+            # HTTPError — match production so callers' `except HTTPStatusError`
+            # blocks behave correctly.
+            raise httpx.HTTPStatusError(
+                f"status {self.status_code}",
+                request=httpx.Request("GET", "http://test"),
+                response=self,  # type: ignore[arg-type]
+            )
 
 
 class FakeAsyncClient:
@@ -317,6 +324,63 @@ def test_find_professors_raises_when_no_authors(monkeypatch, mock_discovery_env)
 def test_find_professors_returns_empty_for_zero_count(mock_discovery_env):
     # Should short-circuit without any HTTP call.
     assert asyncio.run(discovery.find_professors("x", 0, [])) == []
+
+
+def test_tavily_429_aborts_discovery_immediately(monkeypatch, mock_discovery_env):
+    """A single Tavily 429 should raise DiscoveryError and circuit-break
+    the rest of the run (no Tavily-quota churn through 60 candidates)."""
+
+    # FakeAsyncClient that returns 429 from Tavily, success from OpenAlex.
+    class _RateLimitedClient(FakeAsyncClient):
+        async def request(self, method, url, **kwargs):
+            self.calls.append({"method": method, "url": url, **kwargs})
+            if url.startswith("https://api.tavily.com"):
+                return _FakeResponse(429, {"error": "rate limit"})
+            for (m, prefix), payload in self.routes.items():
+                if m == method and url.startswith(prefix):
+                    return _FakeResponse(200, payload)
+            return _FakeResponse(404, {"results": []})
+
+    routes = {
+        ("GET", "https://api.openalex.org/topics"): {
+            "results": [{"id": "https://openalex.org/T1", "display_name": "F", "level": 1}]
+        },
+        ("GET", "https://api.openalex.org/authors"): {
+            "results": [_author(i) for i in range(6)]
+        },
+        ("GET", "https://api.openalex.org/works"): {"results": []},
+    }
+    fake_http = _RateLimitedClient(routes)
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: fake_http)
+
+    # No need to mock _llm_extract_email — _tavily_search raises before it's called.
+
+    with pytest.raises(DiscoveryError, match="Tavily.*429|rate limit"):
+        asyncio.run(discovery.find_professors("neuro", count=2, user_interests=[]))
+
+    # Sanity: we did not blow through dozens of Tavily requests. With 6 candidates
+    # and immediate abort, we expect at most a handful before the gather propagates.
+    tavily_calls = [
+        c for c in fake_http.calls if c["url"].startswith("https://api.tavily.com")
+    ]
+    assert len(tavily_calls) <= 6, f"unexpected Tavily call count: {len(tavily_calls)}"
+
+
+def test_tavily_rate_limit_flag_resets_between_runs(monkeypatch, mock_discovery_env):
+    """Set the flag manually, then verify find_professors clears it at start."""
+    discovery._tavily_rate_limited.set()
+    assert discovery._tavily_rate_limited.is_set()
+
+    # Empty topics → terminates early without reaching Tavily.
+    routes = {("GET", "https://api.openalex.org/topics"): {"results": []}}
+    fake_http = FakeAsyncClient(routes)
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: fake_http)
+
+    with pytest.raises(DiscoveryError):
+        asyncio.run(discovery.find_professors("xxx", count=1, user_interests=[]))
+
+    # The flag should have been cleared at the top of find_professors.
+    assert not discovery._tavily_rate_limited.is_set()
 
 
 def test_llm_pick_topics_includes_user_interests_in_prompt():

@@ -46,7 +46,10 @@ TAVILY_URL = "https://api.tavily.com/search"
 # Sonnet at 1/3 the cost. See docs/04-discovery.md.
 MODEL_SONNET = "claude-sonnet-4-6"
 MODEL_HAIKU = "claude-haiku-4-5"
-CONCURRENCY = 10
+# Default concurrency cap when Settings isn't consulted (e.g., test paths).
+# In normal CLI runs, settings.anthropic_concurrency (env var default 3)
+# overrides this. See docs/04-discovery.md on rate-limit tuning.
+CONCURRENCY = 3
 OVERFETCH_MULTIPLIER = 3
 HTTP_TIMEOUT = 30.0
 
@@ -228,7 +231,10 @@ def _get_anthropic_client() -> anthropic.AsyncAnthropic:
     settings = load_settings()
     if not settings.anthropic_api_key:
         raise ConfigError("ANTHROPIC_API_KEY is not set.")
-    return anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+    return anthropic.AsyncAnthropic(
+        api_key=settings.anthropic_api_key,
+        max_retries=settings.anthropic_max_retries,
+    )
 
 
 async def _llm_pick_topics(
@@ -447,15 +453,44 @@ async def _fetch_recent_works(http: httpx.AsyncClient, author_id: str) -> list[d
     return response.json().get("results", [])
 
 
+# Module-level circuit breaker: set when any task sees a Tavily 429. Sibling
+# tasks check it before issuing their own call so we stop quickly instead of
+# burning through ~60 useless requests when the user's monthly quota is gone.
+# Cleared at the top of every find_professors() so subsequent runs start fresh.
+_tavily_rate_limited: asyncio.Event = asyncio.Event()
+
+
 async def _tavily_search(
     http: httpx.AsyncClient, api_key: str, query: str
 ) -> list[dict]:
-    response = await _request_with_retry(
-        http,
-        "POST",
-        TAVILY_URL,
-        json={"api_key": api_key, "query": query, "max_results": 5},
-    )
+    """One Tavily search. Returns up to 5 results.
+
+    Aborts immediately on 429 — Tavily 429 means monthly quota exhausted, and
+    retrying inside the same run won't recover. The first 429 sets a module-
+    level flag so sibling enrichment tasks short-circuit without piling on more
+    failed requests.
+    """
+    if _tavily_rate_limited.is_set():
+        raise DiscoveryError(
+            "Tavily rate limit hit earlier in this run — aborting."
+        )
+    try:
+        response = await _request_with_retry(
+            http,
+            "POST",
+            TAVILY_URL,
+            json={"api_key": api_key, "query": query, "max_results": 5},
+            max_attempts=1,  # no retry on 429 — monthly quota, not a transient
+        )
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 429:
+            _tavily_rate_limited.set()
+            raise DiscoveryError(
+                "Tavily returned 429 (rate limit / quota exhausted). Your "
+                "monthly Tavily quota is likely used up. Try again later, "
+                "lower the requested professor count, or upgrade your Tavily plan."
+            ) from e
+        raise
     return response.json().get("results", [])
 
 
@@ -504,6 +539,9 @@ async def find_professors(
     if count <= 0:
         return []
 
+    # Reset the Tavily rate-limit circuit breaker for this fresh run.
+    _tavily_rate_limited.clear()
+
     settings = load_settings()
     if not settings.anthropic_api_key:
         raise ConfigError("ANTHROPIC_API_KEY is not set.")
@@ -529,7 +567,7 @@ async def find_professors(
             )
         logger.info("OpenAlex returned %d candidate authors", len(authors))
 
-        sem = asyncio.Semaphore(CONCURRENCY)
+        sem = asyncio.Semaphore(settings.anthropic_concurrency)
 
         async def _enrich(author: dict) -> dict | None:
             async with sem:
@@ -544,7 +582,11 @@ async def find_professors(
                             http, anthropic_client, settings.tavily_api_key, name, institution
                         ),
                     )
-                except Exception as e:  # belt and suspenders
+                except DiscoveryError:
+                    # Fatal (e.g., Tavily rate limit). Propagate so the whole
+                    # discovery stage aborts rather than logging and continuing.
+                    raise
+                except Exception as e:  # belt and suspenders for unexpected per-task errors
                     logger.warning("enrichment failed for %s: %s", name, e)
                     return None
                 email, page = email_page

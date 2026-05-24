@@ -41,6 +41,16 @@ class Settings:
     send_enabled: bool
     send_daily_cap: int
     data_dir: Path
+    # Concurrency cap for parallel Anthropic calls in each pipeline stage
+    # (discovery enrichment / matching / drafting). Tier 1 Anthropic accounts
+    # have a 50 RPM cap shared across the org — too-high concurrency triggers
+    # 429s the SDK can't always retry through. Default 3 is safe on Tier 1;
+    # raise to 10+ once you've upgraded to Tier 2.
+    anthropic_concurrency: int
+    # SDK-level retry attempts for transient errors (429, 5xx, network).
+    # Anthropic's SDK honors Retry-After headers; we just give it more chances
+    # to ride out a long rate-limit window.
+    anthropic_max_retries: int
 
     @property
     def db_path(self) -> Path:
@@ -85,4 +95,6 @@ def load_settings() -> Settings:
         send_enabled=_env_bool("SEND_ENABLED", False),
         send_daily_cap=_env_int("SEND_DAILY_CAP", 20),
         data_dir=data_dir,
+        anthropic_concurrency=_env_int("ANTHROPIC_CONCURRENCY", 3),
+        anthropic_max_retries=_env_int("ANTHROPIC_MAX_RETRIES", 5),
     )
