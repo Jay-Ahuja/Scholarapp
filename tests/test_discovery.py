@@ -21,7 +21,6 @@ import pytest
 from scholarapp.errors import DiscoveryError
 from scholarapp.modules import discovery
 
-
 # ---------------------------------------------------------------------------
 # Pure-function unit tests
 # ---------------------------------------------------------------------------

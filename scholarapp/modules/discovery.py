@@ -169,7 +169,7 @@ def _extract_tool_input(response: Any, expected_name: str) -> dict[str, Any]:
             getattr(block, "type", None) == "tool_use"
             and getattr(block, "name", None) == expected_name
         ):
-            return getattr(block, "input")
+            return block.input
     raise DiscoveryError(
         f"Claude did not call the expected tool `{expected_name}`."
     )
