@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -101,6 +101,18 @@ class SyncReport(BaseModel):
 
 
 _SLUG_NONALNUM = re.compile(r"[^a-z0-9-]+")
+
+
+def _to_naive_utc(dt: datetime) -> datetime:
+    """Normalize a datetime to naive UTC for comparison.
+
+    SQLite stores updated_at without tz info; the YAML round-trip restores it
+    as tz-aware (+00:00). Both represent the same moment, but compare unequal
+    in Python — so we strip tz before comparing.
+    """
+    if dt.tzinfo is not None:
+        return dt.astimezone(UTC).replace(tzinfo=None)
+    return dt
 
 
 def _make_slug(name: str, draft_id: str) -> str:
@@ -278,6 +290,16 @@ def write_drafts_to_disk(run_id: str) -> Path:
 
             slug = _make_slug(prof.name, draft.id)
             file_path = drafts_dir / f"{slug}.md"
+
+            # Set file_path + flush FIRST so SQLAlchemy's `onupdate=_utcnow` fires
+            # on the row and `draft.updated_at` advances in memory. Then render the
+            # file with the post-flush timestamp — this way the file's frontmatter
+            # snapshot matches the DB exactly, so sync's conflict-detection
+            # warning (DB updated_at > file snapshot) doesn't fire spuriously on
+            # every first sync after a write.
+            draft.file_path = str(file_path.resolve())
+            session.flush()
+
             content = render_draft_file(
                 draft_id=draft.id,
                 professor_name=prof.name,
@@ -290,7 +312,6 @@ def write_drafts_to_disk(run_id: str) -> Path:
                 body=draft.body,
             )
             file_path.write_text(content)
-            draft.file_path = str(file_path.resolve())
 
     return drafts_dir
 
@@ -339,12 +360,17 @@ def _sync_one_file(session, run_id: str, file_path: Path, report: SyncReport) ->
         )
 
     # Conflict detection: warn if the DB was modified after the file was written.
-    if parsed.updated_at is not None and draft.updated_at != parsed.updated_at:
-        report.warnings.append(
-            f"{file_path.name}: DB updated_at ({draft.updated_at.isoformat()}) "
-            f"differs from the file's snapshot ({parsed.updated_at.isoformat()}); "
-            "another process may have modified this draft after the file was written"
-        )
+    # Normalize to naive UTC for comparison — SQLite stores updated_at as naive
+    # while the round-tripped YAML value comes back tz-aware (+00:00).
+    if parsed.updated_at is not None:
+        file_ts = _to_naive_utc(parsed.updated_at)
+        db_ts = _to_naive_utc(draft.updated_at)
+        if db_ts != file_ts:
+            report.warnings.append(
+                f"{file_path.name}: DB updated_at ({db_ts.isoformat()}) "
+                f"differs from the file's snapshot ({file_ts.isoformat()}); "
+                "another process may have modified this draft after the file was written"
+            )
 
     # Read-only field tampering: ignore + warn.
     prof = session.get(Professor, draft.professor_id)

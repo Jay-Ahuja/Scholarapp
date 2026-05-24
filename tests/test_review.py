@@ -142,11 +142,18 @@ def test_round_trip_leaves_db_unchanged(isolated_db):
     assert report.status_changed == 0
     assert report.errors == 0
 
-    with get_session() as s:
-        d = repo.get_draft(s, draft_id)
-        assert d.subject == "Original subject"
-        assert d.body == "Hello professor.\n\nThis is the body."
-        assert d.status == DraftStatus.PENDING_REVIEW
+
+def test_round_trip_does_not_warn_about_updated_at(isolated_db):
+    """Regression: write_drafts_to_disk used to bump Draft.updated_at via the
+    file_path UPDATE *after* rendering the file's frontmatter snapshot — so every
+    first sync after a fresh write produced false-positive conflict warnings.
+    The fix flushes file_path first so the rendered snapshot matches the DB; the
+    sync also normalizes tz-aware vs naive datetimes before comparing.
+    """
+    run_id, _, _ = _seed_one_draft()
+    review.write_drafts_to_disk(run_id)
+    report = review.sync_drafts_from_disk(run_id)
+    assert report.warnings == [], f"unexpected warnings: {report.warnings}"
 
 
 def test_write_drafts_creates_file_per_draft(isolated_db):

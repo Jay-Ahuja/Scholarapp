@@ -217,6 +217,48 @@ The Claude usage summary still prints at the end, so you see exactly what the
 partial run cost. If the discovered list looks wrong (off-topic professors,
 missing emails), edit `inputs/prompt.md` to be more specific and re-run.
 
+## CLI styling
+
+Every visible output goes through [scholarapp/ui.py](../scholarapp/ui.py), a thin
+Rich-based rendering layer. The CLI module (`scholarapp/cli.py`) imports
+formatter functions from `ui`; pipeline modules under `scholarapp/modules/`
+never import Rich — they stay pure per the conventions above.
+
+What the user sees:
+
+- **Colored section dividers** between pipeline stages (Parse, Discover, Match,
+  Draft, Done). Rendered via `ui.section("...")`.
+- **Spinners** during long network-bound calls (prompt parse, discovery,
+  matching, drafting). `ui.spinner("...")` is a context manager — clears when
+  the block exits, even on failure.
+- **Rich Tables** for `scholar list`, `scholar status`, the discovered-professors
+  list during a run, and the end-of-run Claude usage breakdown. Status columns
+  are color-coded (`pending`/`drafting` yellow, `review` cyan, `done` green,
+  `failed` red; `approved` green, `rejected` red, `sent` bright-green).
+- **Rich Panels** for `scholar approve`'s sync report — counts at top, then a
+  yellow-bordered Warnings panel and a red-bordered Errors panel only when
+  present.
+- **Errors** routed via `ui.error(...)` to stderr (so pipes don't pollute).
+
+### Compatibility
+
+- **Non-TTY (pipes, CI):** Rich auto-detects and degrades to plain text. The
+  output of `scholar run --stop-after parse | cat` contains no ANSI escapes
+  and is still readable.
+- **`NO_COLOR=1`:** Rich respects the convention — every command runs without
+  colors. Useful in dashboards/logs that don't strip ANSI.
+- **`logging`** still writes warnings to stderr independently — Rich panels
+  don't swallow them.
+
+### For maintainers
+
+- All formatter functions live in `ui.py`. Adding a new visual element →
+  add a function there, not in cli.py.
+- Tests in [tests/test_ui.py](../tests/test_ui.py) monkeypatch the module-level
+  `console` / `error_console` with a fresh `Console(record=True)` and inspect
+  `export_text()`. **Read it once** — `export_text(clear=True)` is the default
+  and the buffer empties after the first call.
+
 ## Cost observability
 
 Every `scholar run` prints a per-call token + cost summary when the pipeline
