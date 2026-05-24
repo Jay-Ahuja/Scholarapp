@@ -383,6 +383,195 @@ def test_tavily_rate_limit_flag_resets_between_runs(monkeypatch, mock_discovery_
     assert not discovery._tavily_rate_limited.is_set()
 
 
+# ---------------------------------------------------------------------------
+# Within-run deduplication
+# ---------------------------------------------------------------------------
+
+
+def _author_with(
+    idx: int, name: str, institution: str, department: str | None = None
+) -> dict:
+    """Author dict with controllable name / institution / department."""
+    inst: dict = {"display_name": institution, "type": "education"}
+    if department is not None:
+        inst["department"] = department
+    return {
+        "id": f"https://openalex.org/A{idx}",
+        "display_name": name,
+        "last_known_institutions": [inst],
+        "cited_by_count": 1000 - idx,
+        "works_count": 50,
+    }
+
+
+def test_dedup_key_uses_name_institution_department():
+    a = _author_with(1, "Jane Doe", "MIT", "Brain & Cognitive Sciences")
+    b = _author_with(2, "Jane Doe", "MIT", "Brain & Cognitive Sciences")
+    c = _author_with(3, "Jane Doe", "MIT", "Computer Science")
+    # Same name + institution but different department → NOT the same professor.
+    assert discovery._dedup_key(a) == discovery._dedup_key(b)
+    assert discovery._dedup_key(a) != discovery._dedup_key(c)
+    # Department participates in the key.
+    assert len(discovery._dedup_key(a)) == 3
+
+
+def test_dedup_key_falls_back_to_name_institution_without_department():
+    a = _author_with(1, "Jane Doe", "MIT")  # no department key
+    b = _author_with(2, "Jane Doe", "MIT", "")  # empty department
+    # Both collapse to the 2-tuple (name, institution) fallback.
+    assert discovery._dedup_key(a) == discovery._dedup_key(b)
+    assert len(discovery._dedup_key(a)) == 2
+
+
+def test_dedup_key_is_case_and_whitespace_insensitive():
+    a = _author_with(1, "Jane Doe", "MIT")
+    b = _author_with(2, "  jane   doe ", "mit")
+    assert discovery._dedup_key(a) == discovery._dedup_key(b)
+
+
+def test_dedup_authors_keeps_first_seen_order_and_drops_repeats():
+    authors = [
+        _author_with(0, "Jane Doe", "MIT"),
+        _author_with(1, "John Roe", "Stanford"),
+        _author_with(2, "Jane Doe", "MIT"),  # dup of 0
+    ]
+    deduped = discovery._dedup_authors(authors)
+    assert [a["display_name"] for a in deduped] == ["Jane Doe", "John Roe"]
+    # First-seen record is the one retained.
+    assert deduped[0]["id"] == "https://openalex.org/A0"
+
+
+def test_dedup_authors_no_duplicates_is_unchanged():
+    authors = [
+        _author_with(0, "A", "MIT"),
+        _author_with(1, "B", "MIT"),
+        _author_with(2, "C", "Stanford"),
+    ]
+    assert discovery._dedup_authors(authors) == authors
+
+
+def _dedup_routes(authors: list[dict]) -> dict:
+    return {
+        ("GET", "https://api.openalex.org/topics"): {
+            "results": [
+                {"id": "https://openalex.org/C1", "display_name": "F", "level": 1}
+            ]
+        },
+        ("GET", "https://api.openalex.org/authors"): {"results": authors},
+        ("GET", "https://api.openalex.org/works"): {"results": []},
+        ("POST", "https://api.tavily.com/search"): {
+            "results": [{"title": "x", "url": "https://mit.edu/x", "content": "..."}]
+        },
+    }
+
+
+def test_find_professors_dedups_duplicate_professor_and_pays_once(
+    monkeypatch, mock_discovery_env
+):
+    """A duplicated professor returns once AND the paid lookup runs once for them."""
+    extract_calls: list[str] = []
+
+    async def _email(_client, name, _inst, _results):
+        extract_calls.append(name)
+        return discovery._EmailExtraction(email="jane@mit.edu", faculty_page_url=None)
+
+    monkeypatch.setattr(discovery, "_llm_extract_email", _email)
+
+    # Three OpenAlex records: two are the same professor (name+inst+dept).
+    authors = [
+        _author_with(0, "Jane Doe", "MIT", "Brain & Cognitive Sciences"),
+        _author_with(1, "Jane Doe", "MIT", "Brain & Cognitive Sciences"),  # dup
+        _author_with(2, "John Roe", "Stanford", "Computer Science"),
+    ]
+    fake_http = FakeAsyncClient(_dedup_routes(authors))
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: fake_http)
+
+    results = asyncio.run(
+        discovery.find_professors("neuroscience", count=5, user_interests=[])
+    )
+
+    # Duplicate professor appears at most once in the returned results.
+    names = [r.name for r in results]
+    assert names.count("Jane Doe") == 1
+    assert sorted(names) == ["Jane Doe", "John Roe"]
+
+    # Paid lookup (Claude email extraction) ran once for the duplicated professor.
+    assert extract_calls.count("Jane Doe") == 1
+
+    # And the paid external Tavily search was issued once for that professor.
+    tavily_calls = [
+        c for c in fake_http.calls if c["url"].startswith("https://api.tavily.com")
+    ]
+    jane_tavily = [c for c in tavily_calls if "Jane Doe" in c["json"]["query"]]
+    assert len(jane_tavily) == 1
+    # Two unique professors total → exactly two Tavily calls.
+    assert len(tavily_calls) == 2
+
+
+def test_find_professors_dedup_falls_back_to_name_institution_without_department(
+    monkeypatch, mock_discovery_env
+):
+    """When department is absent, name + institution match collapses duplicates."""
+    extract_calls: list[str] = []
+
+    async def _email(_client, name, _inst, _results):
+        extract_calls.append(name)
+        return discovery._EmailExtraction(email="jane@mit.edu", faculty_page_url=None)
+
+    monkeypatch.setattr(discovery, "_llm_extract_email", _email)
+
+    authors = [
+        _author_with(0, "Jane Doe", "MIT"),  # no department
+        _author_with(1, "Jane Doe", "MIT"),  # no department → dup
+    ]
+    fake_http = FakeAsyncClient(_dedup_routes(authors))
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: fake_http)
+
+    results = asyncio.run(
+        discovery.find_professors("neuroscience", count=5, user_interests=[])
+    )
+
+    assert [r.name for r in results] == ["Jane Doe"]
+    assert extract_calls.count("Jane Doe") == 1
+    tavily_calls = [
+        c for c in fake_http.calls if c["url"].startswith("https://api.tavily.com")
+    ]
+    assert len(tavily_calls) == 1
+
+
+def test_find_professors_no_duplicates_unchanged_results_and_lookup_count(
+    monkeypatch, mock_discovery_env
+):
+    """A duplicate-free pool yields the same results and the same paid-lookup count."""
+    extract_calls: list[str] = []
+
+    async def _email(_client, name, _inst, _results):
+        extract_calls.append(name)
+        return discovery._EmailExtraction(email="x@mit.edu", faculty_page_url=None)
+
+    monkeypatch.setattr(discovery, "_llm_extract_email", _email)
+
+    authors = [
+        _author_with(0, "Alice", "MIT", "Physics"),
+        _author_with(1, "Bob", "MIT", "Physics"),
+        _author_with(2, "Carol", "Stanford", "Biology"),
+    ]
+    fake_http = FakeAsyncClient(_dedup_routes(authors))
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: fake_http)
+
+    results = asyncio.run(
+        discovery.find_professors("neuroscience", count=3, user_interests=[])
+    )
+
+    assert sorted(r.name for r in results) == ["Alice", "Bob", "Carol"]
+    # One paid lookup per distinct professor — nothing dropped, nothing doubled.
+    assert sorted(extract_calls) == ["Alice", "Bob", "Carol"]
+    tavily_calls = [
+        c for c in fake_http.calls if c["url"].startswith("https://api.tavily.com")
+    ]
+    assert len(tavily_calls) == 3
+
+
 def test_llm_pick_topics_includes_user_interests_in_prompt():
     """The interests should reach the model as the strongest signal — see pick_topics.txt."""
 

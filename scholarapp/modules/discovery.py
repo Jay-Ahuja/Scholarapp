@@ -141,6 +141,76 @@ def _short_id(openalex_url_or_id: str) -> str:
     return openalex_url_or_id.rsplit("/", 1)[-1]
 
 
+def _author_identity(author: dict) -> tuple[str, str, str]:
+    """Extract (name, institution, department) from a raw OpenAlex author dict.
+
+    Mirrors how `_enrich` reads name/institution so the dedup key and the enriched
+    candidate stay consistent. Department is read from the first
+    `last_known_institutions` entry if OpenAlex supplies one; most author records
+    don't carry it, in which case it's the empty string and the dedup falls back to
+    name + institution alone (see `_dedup_key`).
+    """
+    name = author.get("display_name") or ""
+    inst_list = author.get("last_known_institutions") or []
+    first_inst = inst_list[0] if inst_list else {}
+    institution = first_inst.get("display_name", "") if first_inst else ""
+    department = first_inst.get("department", "") if first_inst else ""
+    return name, institution, department
+
+
+def _dedup_key(author: dict) -> tuple[str, ...]:
+    """Within-run identity key for an author.
+
+    Two candidates are the SAME professor when their name, institution, AND
+    department all match. When a candidate has no department, fall back to matching
+    on name + institution alone. Matching is case-insensitive and whitespace-
+    insensitive so trivial formatting differences don't defeat dedup.
+    """
+    name, institution, department = _author_identity(author)
+
+    def _norm(s: str) -> str:
+        return " ".join(s.split()).casefold()
+
+    name_k = _norm(name)
+    inst_k = _norm(institution)
+    dept_k = _norm(department)
+    if dept_k:
+        return (name_k, inst_k, dept_k)
+    return (name_k, inst_k)
+
+
+def _dedup_authors(authors: list[dict]) -> list[dict]:
+    """Drop within-run duplicate professors, keeping first-seen order.
+
+    Applied BEFORE enrichment so a duplicate never triggers a second paid Tavily
+    web search + Claude email extraction. Authors with an empty name AND empty
+    institution have no usable identity, so we keep them as-is (no key collapsing).
+    """
+    seen: set[tuple[str, ...]] = set()
+    deduped: list[dict] = []
+    dropped = 0
+    for author in authors:
+        key = _dedup_key(author)
+        # An all-empty identity carries no signal — don't collapse distinct
+        # records that merely lack name + institution into one.
+        if not any(key):
+            deduped.append(author)
+            continue
+        if key in seen:
+            dropped += 1
+            continue
+        seen.add(key)
+        deduped.append(author)
+    if dropped:
+        logger.info(
+            "Deduplicated %d author(s) within run (%d unique of %d).",
+            dropped,
+            len(deduped),
+            len(authors),
+        )
+    return deduped
+
+
 def _decompress_abstract(inv_index: dict[str, list[int]] | None) -> str | None:
     """OpenAlex stores abstracts as inverted indexes; reconstruct the prose."""
     if not inv_index:
@@ -567,14 +637,17 @@ async def find_professors(
             )
         logger.info("OpenAlex returned %d candidate authors", len(authors))
 
+        # Within-run dedup BEFORE enrichment: a professor that OpenAlex surfaces
+        # more than once must be looked up at most once so we don't pay twice for
+        # the Tavily search + Claude email extraction. Scoped to this run only.
+        authors = _dedup_authors(authors)
+
         sem = asyncio.Semaphore(settings.anthropic_concurrency)
 
         async def _enrich(author: dict) -> dict | None:
             async with sem:
                 author_id = author.get("id") or ""
-                name = author.get("display_name") or ""
-                inst_list = author.get("last_known_institutions") or []
-                institution = inst_list[0].get("display_name", "") if inst_list else ""
+                name, institution, _department = _author_identity(author)
                 try:
                     works, email_page = await asyncio.gather(
                         _safe_works(http, author_id, name),

@@ -39,6 +39,12 @@ field (str) ──┐
     └─────────┬───────────┘
               │  ~3×count authors (over-fetch)
               ▼
+    ┌─────────────────────┐
+    │ Dedup within run    │  _dedup_authors — collapse duplicate
+    │ (name, inst, dept)  │  professors BEFORE any paid lookup
+    └─────────┬───────────┘
+              │  unique authors, first-seen order preserved
+              ▼
     For each author, in parallel (semaphore=10):
     ┌────────────────────────────┐       ┌────────────────────────────┐
     │ GET /works                 │       │ POST tavily.com/search     │
@@ -176,6 +182,57 @@ parallel. Why over-fetch?
 If fewer than `count` survive, `find_professors` logs a warning and returns what
 we have rather than failing — partial results are still useful.
 
+## Within-run deduplication
+
+OpenAlex sometimes surfaces the same professor more than once in a single
+`/authors` response (e.g., near-duplicate author records, or the same person under
+slightly different formatting). We collapse those duplicates **after** the
+over-fetched pool comes back from `/authors` and **before** the per-author
+enrichment fan-out (`_enrich` → Tavily web search + Claude email extraction). The
+call site is a single line in `find_professors`:
+
+```python
+authors = _dedup_authors(authors)
+```
+
+**Why before enrichment — the cost rationale.** Enrichment is the only paid step in
+discovery (one Tavily request + one Claude `_llm_extract_email` call per candidate).
+If a duplicate slipped through, we'd pay for that professor's lookup twice and could
+return them twice. Deduping first guarantees each distinct professor is looked up at
+most once.
+
+**Identity key** (`_dedup_key`, built from `_author_identity`): two candidates are
+the same professor when their **name, institution, AND department** all match.
+Department comes from the first `last_known_institutions` entry when OpenAlex
+supplies one — most author records don't carry it. When department is absent the key
+falls back to **(name, institution)** alone. Matching is case- and
+whitespace-insensitive (`" ".join(s.split()).casefold()`), so trivial formatting
+differences don't defeat the dedup. First-seen order is preserved.
+
+`_author_identity` reads name and institution exactly the way `_enrich` does, so the
+dedup key and the enriched candidate stay consistent.
+
+**No-identity records pass through.** A candidate with an empty name AND empty
+institution has no usable identity. Rather than collapse all such records into one,
+`_dedup_authors` keeps each as-is — losing distinct candidates is worse than letting
+a rare signal-free record through to enrichment (where it'll likely drop on email
+validation anyway).
+
+**Scope: in-memory, single run only.** The `seen` set lives for the duration of one
+`find_professors` call. There is **no cross-run dedup and no schema change** — a
+professor discovered in an earlier run is not remembered here. If you want
+persistent de-duplication across runs, that's a separate, database-backed feature
+(query existing `professors` rows before enriching).
+
+**No backfill.** Dedup runs after the `count * 3` over-fetch, so it normally removes
+only a handful of dupes from a deliberately oversized pool. If it ever leaves fewer
+than `count` unique professors, that's acceptable — we do **not** re-query OpenAlex
+to top the pool back up. Returning fewer is the same partial-results contract as the
+email-validation drop above.
+
+When any duplicates are dropped, `_dedup_authors` logs at INFO:
+`Deduplicated N author(s) within run (U unique of T).`
+
 ## Tavily query construction
 
 Current query:
@@ -303,7 +360,9 @@ To add a new academic data source (e.g., Semantic Scholar):
 1. Add a fetcher: `async def _list_authors_semantic_scholar(http, field, count)`
    returning the same `dict` shape used by the OpenAlex path.
 2. In `find_professors`, after `_list_authors`, merge `_list_authors_semantic_scholar`
-   results, de-dupe by name + institution.
+   results, then run them through the existing `_dedup_authors` (which already
+   de-dupes by name + institution + department) before enrichment — that way a
+   professor surfaced by both sources is enriched once.
 3. Update `docs/04-discovery.md` (this file) and add tests with fixture JSON for
    the new source's response shape.
 4. New env var for any API key needed; add to `config.py` and `.env.example`.
