@@ -620,3 +620,134 @@ def test_llm_pick_topics_includes_user_interests_in_prompt():
     assert "user's specific interests" in user_text
     assert "MRI segmentation" in user_text
     assert "CNN" in user_text
+
+
+# ---------------------------------------------------------------------------
+# exclude_ids — top-up support (filter before enrichment + fetch sizing)
+# ---------------------------------------------------------------------------
+
+
+def test_filter_excluded_drops_by_short_id():
+    authors = [_author(0), _author(1), _author(2)]  # A0, A1, A2
+    kept = discovery._filter_excluded(authors, {"A1"})
+    assert [a["id"] for a in kept] == [
+        "https://openalex.org/A0",
+        "https://openalex.org/A2",
+    ]
+
+
+def test_filter_excluded_empty_set_is_passthrough():
+    authors = [_author(0), _author(1)]
+    assert discovery._filter_excluded(authors, set()) is authors
+
+
+def test_find_professors_excludes_ids_before_enrichment(monkeypatch, mock_discovery_env):
+    """Excluded authors never trigger a paid Tavily search / Claude extraction."""
+    extract_calls: list[str] = []
+
+    async def _email(_client, name, _inst, _results):
+        extract_calls.append(name)
+        return discovery._EmailExtraction(email="p@mit.edu", faculty_page_url=None)
+
+    monkeypatch.setattr(discovery, "_llm_extract_email", _email)
+
+    routes = {
+        ("GET", "https://api.openalex.org/topics"): {
+            "results": [{"id": "https://openalex.org/C1", "display_name": "F", "level": 1}]
+        },
+        ("GET", "https://api.openalex.org/authors"): {
+            "results": [_author(i) for i in range(4)]  # A0..A3
+        },
+        ("GET", "https://api.openalex.org/works"): {"results": []},
+        ("POST", "https://api.tavily.com/search"): {
+            "results": [{"title": "x", "url": "https://mit.edu/x", "content": "..."}]
+        },
+    }
+    fake_http = FakeAsyncClient(routes)
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: fake_http)
+
+    results = asyncio.run(
+        discovery.find_professors(
+            "neuro", count=2, user_interests=[], exclude_ids={"A0", "A1"}
+        )
+    )
+
+    # A0/A1 are excluded BEFORE enrichment → never looked up, never returned.
+    names = [r.name for r in results]
+    assert "Prof 0" not in names
+    assert "Prof 1" not in names
+    assert set(names) == {"Prof 2", "Prof 3"}
+    assert "Prof 0" not in extract_calls
+    assert "Prof 1" not in extract_calls
+    tavily_calls = [
+        c for c in fake_http.calls if c["url"].startswith("https://api.tavily.com")
+    ]
+    assert len(tavily_calls) == 2  # only the two non-excluded professors
+
+
+def test_find_professors_sizes_fetch_up_by_exclude_count(monkeypatch, mock_discovery_env):
+    """The OpenAlex /authors per_page grows by len(exclude_ids) so NEW candidates fit."""
+    async def _email(_client, _name, _inst, _results):
+        return discovery._EmailExtraction(email="p@mit.edu", faculty_page_url=None)
+
+    monkeypatch.setattr(discovery, "_llm_extract_email", _email)
+
+    routes = {
+        ("GET", "https://api.openalex.org/topics"): {
+            "results": [{"id": "https://openalex.org/C1", "display_name": "F", "level": 1}]
+        },
+        ("GET", "https://api.openalex.org/authors"): {"results": [_author(0)]},
+        ("GET", "https://api.openalex.org/works"): {"results": []},
+        ("POST", "https://api.tavily.com/search"): {
+            "results": [{"title": "x", "url": "https://mit.edu/x", "content": "..."}]
+        },
+    }
+    fake_http = FakeAsyncClient(routes)
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: fake_http)
+
+    asyncio.run(
+        discovery.find_professors(
+            "neuro", count=2, user_interests=[], exclude_ids={"A9", "A8", "A7"}
+        )
+    )
+
+    authors_call = next(
+        c for c in fake_http.calls
+        if c["url"].startswith("https://api.openalex.org/authors")
+    )
+    # target_pool = (count + len(exclude_ids)) * OVERFETCH_MULTIPLIER = (2+3)*3 = 15.
+    expected_pool = (2 + 3) * discovery.OVERFETCH_MULTIPLIER
+    assert authors_call["params"]["per_page"] == max(25, expected_pool)
+
+
+def test_find_professors_exclude_none_preserves_initial_fetch_size(
+    monkeypatch, mock_discovery_env
+):
+    """exclude_ids=None sizes the fetch exactly as before: count * OVERFETCH."""
+    async def _email(_client, _name, _inst, _results):
+        return discovery._EmailExtraction(email="p@mit.edu", faculty_page_url=None)
+
+    monkeypatch.setattr(discovery, "_llm_extract_email", _email)
+
+    routes = {
+        ("GET", "https://api.openalex.org/topics"): {
+            "results": [{"id": "https://openalex.org/C1", "display_name": "F", "level": 1}]
+        },
+        ("GET", "https://api.openalex.org/authors"): {"results": [_author(0)]},
+        ("GET", "https://api.openalex.org/works"): {"results": []},
+        ("POST", "https://api.tavily.com/search"): {
+            "results": [{"title": "x", "url": "https://mit.edu/x", "content": "..."}]
+        },
+    }
+    fake_http = FakeAsyncClient(routes)
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: fake_http)
+
+    asyncio.run(discovery.find_professors("neuro", count=10, user_interests=[]))
+
+    authors_call = next(
+        c for c in fake_http.calls
+        if c["url"].startswith("https://api.openalex.org/authors")
+    )
+    # Unchanged from baseline: min(200, max(25, count * OVERFETCH)) = min(200, 30) = 30.
+    expected = min(200, max(25, 10 * discovery.OVERFETCH_MULTIPLIER))
+    assert authors_call["params"]["per_page"] == expected

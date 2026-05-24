@@ -508,6 +508,22 @@ async def _list_authors(
     return response.json().get("results", [])[:target_count]
 
 
+def _filter_excluded(authors: list[dict], exclude_ids: set[str]) -> list[dict]:
+    """Drop authors whose short OpenAlex ID is in `exclude_ids`.
+
+    Applied BEFORE enrichment so excluded authors cost no Tavily/Haiku. The key is
+    the same short form as `ProfessorCandidate.openalex_id` and `_short_id` output.
+    """
+    if not exclude_ids:
+        return authors
+    kept: list[dict] = []
+    for author in authors:
+        if _short_id(author.get("id") or "") in exclude_ids:
+            continue
+        kept.append(author)
+    return kept
+
+
 async def _fetch_recent_works(http: httpx.AsyncClient, author_id: str) -> list[dict]:
     short = _short_id(author_id)
     response = await _request_with_retry(
@@ -599,15 +615,29 @@ async def _safe_works(http: httpx.AsyncClient, author_id: str, name: str) -> lis
 
 
 async def find_professors(
-    field: str, count: int, user_interests: list[str]
+    field: str,
+    count: int,
+    user_interests: list[str],
+    *,
+    exclude_ids: set[str] | None = None,
 ) -> list[ProfessorCandidate]:
     """Discover up to `count` professors in `field` with verified academic emails.
 
     `user_interests` is accepted for future use (e.g., narrowing the author pool)
     but not currently consulted — matching against interests happens in Step 5.
+
+    `exclude_ids` holds short-form OpenAlex author IDs (same form as
+    `ProfessorCandidate.openalex_id`) already discovered earlier in this run. They
+    are filtered out BEFORE enrichment so they cost no Tavily/Haiku, and the
+    OpenAlex fetch is sized up by `len(exclude_ids)` so that — after removing the
+    excluded top-cited authors — up to `count` NEW candidates can still surface.
+    A naive re-fetch would just return the same top-cited authors, so the top-up
+    loop in the CLI relies on this to make progress across passes.
     """
     if count <= 0:
         return []
+
+    exclude_ids = exclude_ids or set()
 
     # Reset the Tavily rate-limit circuit breaker for this fresh run.
     _tavily_rate_limited.clear()
@@ -628,7 +658,10 @@ async def find_professors(
         )
         logger.info("Resolved field %r to topic ids %s", field, topic_ids)
 
-        target_pool = count * OVERFETCH_MULTIPLIER
+        # Over-fetch by OVERFETCH_MULTIPLIER (email resolution drops candidates)
+        # AND by len(exclude_ids) so the already-seen top-cited authors we'll drop
+        # don't eat into the `count` NEW candidates we still want this pass.
+        target_pool = (count + len(exclude_ids)) * OVERFETCH_MULTIPLIER
         authors = await _list_authors(http, topic_ids, target_pool)
         if not authors:
             raise DiscoveryError(
@@ -636,6 +669,10 @@ async def find_professors(
                 "The topic may be too narrow."
             )
         logger.info("OpenAlex returned %d candidate authors", len(authors))
+
+        # Filter out IDs already discovered earlier in this run BEFORE enrichment
+        # so excluded authors never trigger a paid Tavily search + Claude call.
+        authors = _filter_excluded(authors, exclude_ids)
 
         # Within-run dedup BEFORE enrichment: a professor that OpenAlex surfaces
         # more than once must be looked up at most once so we don't pay twice for
