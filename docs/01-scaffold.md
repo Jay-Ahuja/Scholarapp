@@ -166,7 +166,7 @@ Anything else (cache dirs, log levels, etc.) should be added here, not scattered
 | Command | Status | Purpose |
 |---|---|---|
 | `scholar init` | implemented | Creates `~/.scholarapp/` and writes `config.toml` if missing |
-| `scholar run` | partial | Parses inputs, discovers professors, matches relevant projects per professor (Steps 3-5); drafting still pending |
+| `scholar run` | implemented | Full pipeline: parse → discover → match → draft (Steps 3-6). Drafts saved to the DB as `pending_review`; Step 7 writes them as editable markdown files. |
 | `scholar list` | implemented | Tabulates all runs (added in Step 2) |
 | `scholar review <run_id>` | stub | Future: write drafts to disk, open `$EDITOR` |
 | `scholar approve <run_id> [--only <slug>]` | stub | Future: mark drafts approved |
@@ -265,7 +265,7 @@ cache and produces no `parse_resume` row.
 | 3 | [`03-ingestion.md`](03-ingestion.md) | Resume + prompt parsing via Claude |
 | 4 | [`04-discovery.md`](04-discovery.md) | OpenAlex + Tavily professor lookup |
 | 5 | [`05-matching.md`](05-matching.md) | Per-professor project relevance |
-| 6 | `06-drafting.md` (to be written) | Email drafting with prompt caching |
+| 6 | [`06-drafting.md`](06-drafting.md) | Email drafting with prompt caching |
 | 7 | `07-review.md` (to be written) | Editable markdown draft files |
 | 8 | `08-delivery.md` (to be written) | Gmail OAuth + the SEND_ENABLED gate |
 | 9 | `09-smoke-test.md` (to be written) | End-to-end test + top-level README polish |

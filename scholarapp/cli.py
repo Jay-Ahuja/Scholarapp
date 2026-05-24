@@ -31,10 +31,10 @@ class PipelineStage(str, enum.Enum):
 from scholarapp import usage as usage_tracker
 from scholarapp.config import load_settings
 from scholarapp.db import repo
-from scholarapp.db.models import RunStatus
+from scholarapp.db.models import DraftStatus, Project, RunStatus
 from scholarapp.db.session import get_session
 from scholarapp.errors import IngestionError, NotFoundError, ScholarError
-from scholarapp.modules import discovery, ingestion, matching
+from scholarapp.modules import discovery, drafting, ingestion, matching
 
 logging.basicConfig(
     level=logging.WARNING,
@@ -138,7 +138,7 @@ def run(
         case_sensitive=False,
     ),
 ) -> None:
-    """Parse inputs, discover professors, match relevant projects per professor. (Drafting lands in Step 6.)"""
+    """End-to-end: parse inputs, discover professors, match relevant works, draft personalized emails. Drafts saved to the DB; Step 7 writes them as markdown for editing."""
 
     def _impl() -> None:
         tracker = usage_tracker.UsageTracker()
@@ -326,6 +326,80 @@ def run(
         if stop_after == PipelineStage.matching:
             typer.echo("Stopped after matching as requested (--stop-after matching).")
             return
+
+        # --- Step 6: drafting -------------------------------------------------
+        with get_session() as session:
+            draft_requests: list[drafting.DraftRequest] = []
+            request_to_prof_id: list[str] = []
+            for prof in repo.list_professors_for_run(session, run_id):
+                matched_rows = repo.list_matched_projects_for_professor(session, prof.id)
+                if not matched_rows:
+                    typer.echo(f"  skipping {prof.name} — no matched projects")
+                    continue
+                matched_pydantic: list[matching.MatchedProject] = []
+                for mp in matched_rows:
+                    project = session.get(Project, mp.project_id)
+                    if project is None:
+                        continue
+                    matched_pydantic.append(
+                        matching.MatchedProject(
+                            project_id=mp.project_id,
+                            title=project.title,
+                            url=project.url,
+                            why_relevant=mp.why_relevant,
+                        )
+                    )
+                if not matched_pydantic:
+                    typer.echo(f"  skipping {prof.name} — matched rows had no readable projects")
+                    continue
+                draft_requests.append(
+                    drafting.DraftRequest(
+                        professor=drafting.ProfessorForDrafting(
+                            name=prof.name,
+                            institution=prof.institution,
+                            email=prof.email,
+                        ),
+                        matched=matched_pydantic,
+                    )
+                )
+                request_to_prof_id.append(prof.id)
+
+        if not draft_requests:
+            typer.echo("No professors with matched projects — nothing to draft.")
+            return
+
+        typer.echo(f"Drafting {len(draft_requests)} emails...")
+        try:
+            email_drafts = asyncio.run(
+                drafting.draft_emails_for_run(
+                    template=template_text,
+                    resume=resume_data,
+                    requests=draft_requests,
+                    goal=prompt_data.goal,
+                    considerations=prompt_data.considerations,
+                )
+            )
+        except ScholarError as e:
+            with get_session() as session:
+                repo.update_run_status(
+                    session, run_id, RunStatus.FAILED, error=f"drafting failed: {e}"
+                )
+            raise
+
+        with get_session() as session:
+            for prof_id, email_draft in zip(request_to_prof_id, email_drafts):
+                repo.add_draft(
+                    session,
+                    run_id=run_id,
+                    professor_id=prof_id,
+                    subject=email_draft.subject,
+                    body=email_draft.body,
+                    status=DraftStatus.PENDING_REVIEW,
+                )
+            repo.update_run_status(session, run_id, RunStatus.REVIEW)
+
+        typer.echo(f"Drafted {len(email_drafts)} emails. run_id={run_id}")
+        typer.echo(f"Run `scholar review {run_id}` to see them.")
 
     _run_safely(_impl)
 
