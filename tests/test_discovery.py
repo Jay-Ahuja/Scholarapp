@@ -12,6 +12,7 @@ We mock at two levels:
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -206,7 +207,7 @@ def mock_discovery_env(monkeypatch):
 
     monkeypatch.setattr(discovery, "_get_anthropic_client", lambda: _NoopAnthropic())
 
-    async def _pick(_client, _field, candidates):
+    async def _pick(_client, _field, candidates, user_interests=None):
         return [discovery._short_id(candidates[0]["id"])]
 
     monkeypatch.setattr(discovery, "_llm_pick_topics", _pick)
@@ -316,3 +317,54 @@ def test_find_professors_raises_when_no_authors(monkeypatch, mock_discovery_env)
 def test_find_professors_returns_empty_for_zero_count(mock_discovery_env):
     # Should short-circuit without any HTTP call.
     assert asyncio.run(discovery.find_professors("x", 0, [])) == []
+
+
+def test_llm_pick_topics_includes_user_interests_in_prompt():
+    """The interests should reach the model as the strongest signal — see pick_topics.txt."""
+
+    captured: dict = {}
+
+    class _FakeMessages:
+        async def create(self, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(
+                content=[
+                    SimpleNamespace(
+                        type="tool_use",
+                        name="select_topics",
+                        input={"topic_ids": ["T11601"], "rationale": "imaging-focused"},
+                    )
+                ],
+                usage=SimpleNamespace(
+                    input_tokens=100, output_tokens=20,
+                    cache_creation_input_tokens=0, cache_read_input_tokens=0,
+                ),
+            )
+
+    class _FakeClient:
+        messages = _FakeMessages()
+
+    candidates = [
+        {
+            "id": "https://openalex.org/T11601",
+            "display_name": "Neuroscience and Neural Engineering",
+            "field": {"display_name": "Neuroscience"},
+            "subfield": {"display_name": "Neural Engineering"},
+            "keywords": ["BCI", "neural decoding"],
+            "description": "Neural engineering and BCI work.",
+        }
+    ]
+
+    result = asyncio.run(
+        discovery._llm_pick_topics(
+            _FakeClient(),
+            "neuroscience",
+            candidates,
+            user_interests=["CNN", "MRI segmentation", "brain extraction"],
+        )
+    )
+    assert result == ["T11601"]
+    user_text = captured["messages"][0]["content"]
+    assert "user's specific interests" in user_text
+    assert "MRI segmentation" in user_text
+    assert "CNN" in user_text

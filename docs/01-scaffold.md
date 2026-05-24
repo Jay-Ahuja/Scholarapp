@@ -166,7 +166,7 @@ Anything else (cache dirs, log levels, etc.) should be added here, not scattered
 | Command | Status | Purpose |
 |---|---|---|
 | `scholar init` | implemented | Creates `~/.scholarapp/` and writes `config.toml` if missing |
-| `scholar run` | partial | Parses inputs, discovers professors with verified emails, persists professors + projects (Steps 3-4); matching + drafting still pending |
+| `scholar run` | partial | Parses inputs, discovers professors, matches relevant projects per professor (Steps 3-5); drafting still pending |
 | `scholar list` | implemented | Tabulates all runs (added in Step 2) |
 | `scholar review <run_id>` | stub | Future: write drafts to disk, open `$EDITOR` |
 | `scholar approve <run_id> [--only <slug>]` | stub | Future: mark drafts approved |
@@ -186,6 +186,36 @@ These apply to every step. When adding code in later steps, follow them.
 5. **Prompts as `.txt` resources.** Templates go in `scholarapp/prompts/*.txt` and are loaded via `importlib.resources.files("scholarapp.prompts").joinpath("name.txt").read_text()`. This keeps prompts diffable and out of Python string literals.
 6. **One settings load per command.** Call `config.load_settings()` at the top of the command body; pass `Settings` down. No module-level singletons that capture env state at import time.
 7. **`DATA_DIR` is the only writable directory outside the repo.** Tests must override it (typically via `tmp_path`) so they don't pollute the user's real `~/.scholarapp/`.
+
+## Cheap exploration: `scholar run --stop-after`
+
+`scholar run` accepts a `--stop-after {parse,discovery,matching}` flag that halts
+the pipeline at the named checkpoint. Use this to inspect intermediate state
+without paying for later stages.
+
+| `--stop-after` | What runs (and gets charged) | What you see |
+|---|---|---|
+| `parse` | Resume + prompt parse only | `Run` row created, no professors yet |
+| `discovery` | Above + topic pick + author search + email resolution | List of discovered professors with emails |
+| `matching` | Above + project relevance picks per professor | Matched-project rows visible in the DB |
+| (omitted) | Whole pipeline | Drafts (after Step 6) |
+
+Examples:
+
+```bash
+# See who discovery would pick before paying for matching (~$0.02 saved on N=3):
+scholar run --stop-after discovery
+
+# Verify the resume parser extracted what you expected; skip everything else:
+scholar run --stop-after parse
+
+# Run discovery + matching but stop before drafting (relevant once Step 6 lands):
+scholar run --stop-after matching
+```
+
+The Claude usage summary still prints at the end, so you see exactly what the
+partial run cost. If the discovered list looks wrong (off-topic professors,
+missing emails), edit `inputs/prompt.md` to be more specific and re-run.
 
 ## Cost observability
 
@@ -234,7 +264,7 @@ cache and produces no `parse_resume` row.
 | 2 | [`02-persistence.md`](02-persistence.md) | SQLAlchemy models, `init_db()`, `scholar list` and `scholar status` reading the DB |
 | 3 | [`03-ingestion.md`](03-ingestion.md) | Resume + prompt parsing via Claude |
 | 4 | [`04-discovery.md`](04-discovery.md) | OpenAlex + Tavily professor lookup |
-| 5 | `05-matching.md` (to be written) | Per-professor project relevance |
+| 5 | [`05-matching.md`](05-matching.md) | Per-professor project relevance |
 | 6 | `06-drafting.md` (to be written) | Email drafting with prompt caching |
 | 7 | `07-review.md` (to be written) | Editable markdown draft files |
 | 8 | `08-delivery.md` (to be written) | Gmail OAuth + the SEND_ENABLED gate |

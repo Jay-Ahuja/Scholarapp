@@ -22,6 +22,7 @@ The `docs/` directory has one file per implementation step. Read them in order i
 - [docs/02-persistence.md](docs/02-persistence.md) — DB schema and lifecycle
 - [docs/03-ingestion.md](docs/03-ingestion.md) — resume + prompt parsing via Claude
 - [docs/04-discovery.md](docs/04-discovery.md) — professor discovery via OpenAlex + Tavily
+- [docs/05-matching.md](docs/05-matching.md) — per-professor project relevance picks
 - `docs/03-ingestion.md` — resume + prompt parsing (added in Step 3)
 - `docs/04-discovery.md` — professor discovery via OpenAlex + Tavily (added in Step 4)
 - `docs/05-matching.md` — project-to-interest matching (added in Step 5)

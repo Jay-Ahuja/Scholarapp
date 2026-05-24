@@ -11,6 +11,7 @@ prints "Not yet implemented".
 from __future__ import annotations
 
 import asyncio
+import enum
 import hashlib
 import logging
 import shutil
@@ -19,13 +20,21 @@ from pathlib import Path
 
 import typer
 
+
+class PipelineStage(str, enum.Enum):
+    """Checkpoints where `scholar run --stop-after` can halt."""
+
+    parse = "parse"
+    discovery = "discovery"
+    matching = "matching"
+
 from scholarapp import usage as usage_tracker
 from scholarapp.config import load_settings
 from scholarapp.db import repo
 from scholarapp.db.models import RunStatus
 from scholarapp.db.session import get_session
 from scholarapp.errors import IngestionError, NotFoundError, ScholarError
-from scholarapp.modules import discovery, ingestion
+from scholarapp.modules import discovery, ingestion, matching
 
 logging.basicConfig(
     level=logging.WARNING,
@@ -81,6 +90,21 @@ def init() -> None:
     _run_safely(_impl)
 
 
+def _summarize_experiences(experiences: list[ingestion.Experience]) -> str:
+    """Compact, model-friendly summary of resume experiences for the matching call."""
+    if not experiences:
+        return ""
+    lines: list[str] = []
+    for exp in experiences[:6]:  # cap at 6 entries to keep tokens bounded
+        header = f"- {exp.role} at {exp.org}"
+        if exp.years:
+            header += f" ({exp.years})"
+        lines.append(header)
+        for bullet in exp.bullets[:2]:  # first 2 bullets each
+            lines.append(f"    • {bullet}")
+    return "\n".join(lines)
+
+
 def _parse_resume_cached(pdf_path: Path) -> ingestion.ResumeData:
     """Resume parse, memoized by SHA-256 of the PDF bytes.
 
@@ -107,8 +131,14 @@ def run(
         "--inputs",
         help="Directory containing resume.pdf, prompt.md, and template.md.",
     ),
+    stop_after: PipelineStage | None = typer.Option(
+        None,
+        "--stop-after",
+        help="Stop the pipeline after this stage. Saves cost for cheap exploration.",
+        case_sensitive=False,
+    ),
 ) -> None:
-    """Parse inputs, discover professors with verified emails, persist them. (Matching + drafting land in Steps 5-6.)"""
+    """Parse inputs, discover professors, match relevant projects per professor. (Drafting lands in Step 6.)"""
 
     def _impl() -> None:
         tracker = usage_tracker.UsageTracker()
@@ -170,6 +200,10 @@ def run(
 
         typer.echo(f"Parsed inputs. run_id={run_id}")
 
+        if stop_after == PipelineStage.parse:
+            typer.echo("Stopped after parse as requested (--stop-after parse).")
+            return
+
         # --- Step 4: discovery -------------------------------------------------
         with get_session() as session:
             repo.update_run_status(session, run_id, RunStatus.DISCOVERING)
@@ -215,7 +249,83 @@ def run(
                     )
             repo.update_run_status(session, run_id, RunStatus.MATCHING)
 
-        typer.echo(f"Discovered {len(candidates)} professors. run_id={run_id}")
+        typer.echo(f"Discovered {len(candidates)} professors:")
+        for c in candidates:
+            typer.echo(f"  - {c.name} @ {c.institution}  <{c.email}>")
+        typer.echo(f"run_id={run_id}")
+
+        if stop_after == PipelineStage.discovery:
+            typer.echo("Stopped after discovery as requested (--stop-after discovery).")
+            return
+
+        # --- Step 5: matching -------------------------------------------------
+        with get_session() as session:
+            professors = repo.list_professors_for_run(session, run_id)
+            pairs: list[tuple[str, list[matching.ProjectForMatching]]] = []
+            for prof in professors:
+                projects = repo.list_projects_for_professor(session, prof.id)
+                pairs.append(
+                    (
+                        prof.name,
+                        [
+                            matching.ProjectForMatching(
+                                project_id=pr.id,
+                                title=pr.title,
+                                url=pr.url,
+                                abstract=pr.abstract,
+                                year=pr.year,
+                            )
+                            for pr in projects
+                        ],
+                    )
+                )
+
+        if not pairs:
+            typer.echo("No professors to match — skipping.")
+            return
+
+        typer.echo(f"Matching projects for {len(pairs)} professors...")
+        experiences_text = _summarize_experiences(resume_data.experiences)
+        try:
+            matched_lists = asyncio.run(
+                matching.match_projects_for_run(
+                    pairs=pairs,
+                    user_interests=resume_data.interests,
+                    user_experiences=experiences_text,
+                )
+            )
+        except ScholarError as e:
+            with get_session() as session:
+                repo.update_run_status(
+                    session, run_id, RunStatus.FAILED, error=f"matching failed: {e}"
+                )
+            raise
+
+        with get_session() as session:
+            total_matches = 0
+            professors_with_matches = 0
+            for prof, matches in zip(professors, matched_lists):
+                if matches:
+                    professors_with_matches += 1
+                for m in matches:
+                    repo.add_matched_project(
+                        session,
+                        professor_id=prof.id,
+                        project_id=m.project_id,
+                        why_relevant=m.why_relevant,
+                    )
+                    total_matches += 1
+            repo.update_run_status(session, run_id, RunStatus.DRAFTING)
+
+        typer.echo(
+            f"Matched projects for {len(pairs)} professors "
+            f"({professors_with_matches} with ≥1 match, {total_matches} matches total). "
+            f"run_id={run_id}"
+        )
+
+        if stop_after == PipelineStage.matching:
+            typer.echo("Stopped after matching as requested (--stop-after matching).")
+            return
 
     _run_safely(_impl)
 

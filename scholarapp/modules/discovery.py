@@ -232,9 +232,17 @@ def _get_anthropic_client() -> anthropic.AsyncAnthropic:
 
 
 async def _llm_pick_topics(
-    anthropic_client: anthropic.AsyncAnthropic, field: str, candidates: list[dict]
+    anthropic_client: anthropic.AsyncAnthropic,
+    field: str,
+    candidates: list[dict],
+    user_interests: list[str] | None = None,
 ) -> list[str]:
-    """Have Claude select 1–2 OpenAlex topic IDs that match the user's field."""
+    """Have Claude select 1–2 OpenAlex topic IDs that match the user's field.
+
+    If `user_interests` is provided, it's passed to the model as the strongest
+    signal — see pick_topics.txt. This is how "neuroscience" + interests
+    ["CNN", "MRI segmentation"] avoids surfacing clinical/cellular giants.
+    """
     system_text = _load_prompt("pick_topics.txt")
     summarized = [
         {
@@ -247,11 +255,21 @@ async def _llm_pick_topics(
         }
         for c in candidates
     ]
-    user_text = f"field: {field}\n\ncandidates:\n" + "\n".join(
-        f"- {s['id']}  [{s['field']} > {s['subfield']}]  {s['display_name']}\n"
-        f"    keywords: {s['keywords']}\n"
-        f"    description: {s['description']}"
-        for s in summarized
+    interests_line = (
+        f"user's specific interests: {', '.join(user_interests)}\n\n"
+        if user_interests
+        else "user's specific interests: (none provided)\n\n"
+    )
+    user_text = (
+        f"field: {field}\n\n"
+        f"{interests_line}"
+        "candidates:\n"
+        + "\n".join(
+            f"- {s['id']}  [{s['field']} > {s['subfield']}]  {s['display_name']}\n"
+            f"    keywords: {s['keywords']}\n"
+            f"    description: {s['description']}"
+            for s in summarized
+        )
     )
     response = await anthropic_client.messages.create(
         model=MODEL_HAIKU,
@@ -325,24 +343,67 @@ async def _llm_extract_email(
 # ---------------------------------------------------------------------------
 
 
-async def _resolve_topics(
-    http: httpx.AsyncClient,
-    anthropic_client: anthropic.AsyncAnthropic,
-    field: str,
-) -> list[str]:
+async def _search_topics(http: httpx.AsyncClient, query: str) -> list[dict]:
+    """One OpenAlex /topics search. Returns up to 10 candidates."""
     response = await _request_with_retry(
         http,
         "GET",
         f"{OPENALEX_BASE}/topics",
-        params={"search": field, "per_page": 10},
+        params={"search": query, "per_page": 10},
     )
-    candidates = response.json().get("results", [])
-    if not candidates:
+    return response.json().get("results", [])
+
+
+# When merging across many queries we cap the LLM input to keep the prompt small.
+_MAX_TOPIC_CANDIDATES = 15
+# We only use the top-K user interests as search queries; more is noisy and
+# OpenAlex is keyword-bounded anyway.
+_MAX_INTEREST_QUERIES = 5
+
+
+async def _resolve_topics(
+    http: httpx.AsyncClient,
+    anthropic_client: anthropic.AsyncAnthropic,
+    field: str,
+    user_interests: list[str] | None = None,
+) -> list[str]:
+    """Resolve a free-text field to 1–2 OpenAlex topic IDs.
+
+    OpenAlex `/topics?search=` requires an exact-phrase match against the topic
+    display_name — multi-word user fields like "computational neuroscience" often
+    return zero results because no single topic has that exact name. To cover
+    that, we fan out: search the bare field AND each user interest in parallel,
+    de-dupe by ID, and let the LLM pick from the merged set.
+    """
+    queries = [field]
+    if user_interests:
+        queries.extend(user_interests[:_MAX_INTEREST_QUERIES])
+
+    result_sets = await asyncio.gather(*[_search_topics(http, q) for q in queries])
+
+    candidates_by_id: dict[str, dict] = {}
+    for results in result_sets:
+        for r in results:
+            candidates_by_id[r["id"]] = r  # first-seen wins (preserves field-first order)
+
+    if not candidates_by_id:
         raise DiscoveryError(
-            f"OpenAlex returned no topics for field {field!r}. "
-            "Try a more standard term (e.g., 'computational neuroscience' instead of 'comp neuro')."
+            f"OpenAlex returned no topics for field {field!r} or for any of the "
+            f"user's interests. OpenAlex topic search requires an exact phrase "
+            "match — try a more specific keyword in the prompt's field "
+            "(e.g., 'neuroimaging' instead of 'computational neuroscience')."
         )
-    chosen = await _llm_pick_topics(anthropic_client, field, candidates)
+
+    candidates = list(candidates_by_id.values())[:_MAX_TOPIC_CANDIDATES]
+    logger.info(
+        "Topic search across %d queries returned %d unique candidates.",
+        len(queries),
+        len(candidates),
+    )
+
+    chosen = await _llm_pick_topics(
+        anthropic_client, field, candidates, user_interests=user_interests
+    )
     if not chosen:
         raise DiscoveryError(
             f"Could not match field {field!r} to an OpenAlex topic."
@@ -454,7 +515,9 @@ async def find_professors(
     anthropic_client = _get_anthropic_client()
 
     async with httpx.AsyncClient(headers=headers, timeout=HTTP_TIMEOUT) as http:
-        topic_ids = await _resolve_topics(http, anthropic_client, field)
+        topic_ids = await _resolve_topics(
+            http, anthropic_client, field, user_interests=user_interests
+        )
         logger.info("Resolved field %r to topic ids %s", field, topic_ids)
 
         target_pool = count * OVERFETCH_MULTIPLIER

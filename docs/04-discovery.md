@@ -132,6 +132,34 @@ The LLM is constrained to pick from the IDs we passed in (`select_topics` tool w
 a `topic_ids` field; we additionally filter out any returned IDs we didn't provide,
 as a defense against hallucination).
 
+### Interest-aware topic picking
+
+The user's `interests` (extracted from their résumé) flow through `find_professors`
+→ `_resolve_topics` → `_llm_pick_topics` and into the model's user message. The
+[pick_topics.txt](../scholarapp/prompts/pick_topics.txt) prompt instructs the model
+to treat interests as the **strongest signal** when present — overriding a more
+literal match against the bare `field` string.
+
+Interests also feed into the **search itself**, not just the pick. OpenAlex's
+`/topics?search=` is exact-phrase: multi-word queries like "computational
+neuroscience" frequently return zero results because no topic is literally named
+that. To work around this, `_resolve_topics` issues one search per (field +
+interest), runs them in parallel, de-dupes by topic id, and passes the merged
+candidate set to the LLM. So even when the field string itself is too composite,
+shorter interest keywords like "neuroimaging" or "MRI segmentation" surface the
+right topics. Capped at `_MAX_INTEREST_QUERIES = 5` interests, `_MAX_TOPIC_CANDIDATES = 15`
+in the merged set to keep the LLM prompt small.
+
+Why this matters: a user with `field="neuroscience"` and interests `["CNN",
+"MRI segmentation", "brain extraction"]` should land on topic
+`T11601` (Neuroscience and Neural Engineering), not `T10077` (Neuroscience and
+Neuropharmacology Research). Without the interests signal, the LLM picks the most
+literal-sounding match — usually the broad clinical / cellular topic — and
+discovery returns the wrong *kind* of neuroscientist. Matching (Step 5) then
+correctly returns 0 picks for everyone, and the user pays for a useless run.
+
+Pass `user_interests=[]` (the default) to fall back to field-only picking.
+
 ## Over-fetch then filter
 
 We fetch `count * 3` authors from `/authors` and try to enrich every one in
