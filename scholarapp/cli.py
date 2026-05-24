@@ -143,7 +143,8 @@ def init() -> None:
             ui.info("  2. Configure the OAuth consent screen (External, testing mode)")
             ui.info("  3. Create OAuth credentials (type: Desktop app)")
             ui.info(
-                f"  4. Download client_secret.json → place at [bold]{settings.client_secret_path}[/bold]"
+                "  4. Download client_secret.json → place at "
+                f"[bold]{settings.client_secret_path}[/bold]"
             )
             ui.info("  5. Re-run [bold cyan]scholar init[/bold cyan]")
             ui.info("  Full walkthrough: [bold]docs/08-delivery.md[/bold]")
@@ -319,7 +320,9 @@ def run(
         case_sensitive=False,
     ),
 ) -> None:
-    """End-to-end: parse inputs, discover professors, match relevant works, draft personalized emails. Drafts saved to the DB; `scholar review` writes them as markdown for editing."""
+    "End-to-end: parse inputs, discover professors, match relevant works, draft " \
+    "personalized emails. Drafts saved to the DB; `scholar review` writes them as " \
+    "markdown for editing."
 
     def _impl() -> None:
         tracker = usage_tracker.UsageTracker()
@@ -666,7 +669,7 @@ def run(
             raise
 
         with get_session() as session:
-            for prof_id, email_draft in zip(request_to_prof_id, email_drafts):
+            for prof_id, email_draft in zip(request_to_prof_id, email_drafts, strict=True):
                 repo.add_draft(
                     session,
                     run_id=run_id,
