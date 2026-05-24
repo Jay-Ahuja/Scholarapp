@@ -28,3 +28,6 @@ venv/
 
 # Per-user inputs (resume, prompt, template) — keep out of git
 inputs/
+
+# Generated draft emails — contain real names/emails, keep out of git
+drafts/

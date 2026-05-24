@@ -14,7 +14,9 @@ import asyncio
 import enum
 import hashlib
 import logging
+import os
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -34,7 +36,13 @@ from scholarapp.db import repo
 from scholarapp.db.models import DraftStatus, Project, RunStatus
 from scholarapp.db.session import get_session
 from scholarapp.errors import IngestionError, NotFoundError, ScholarError
-from scholarapp.modules import discovery, drafting, ingestion, matching
+from scholarapp.modules import (
+    discovery,
+    drafting,
+    ingestion,
+    matching,
+    review as review_module,
+)
 
 logging.basicConfig(
     level=logging.WARNING,
@@ -427,20 +435,81 @@ def list_runs() -> None:
 
 
 @app.command("review")
-def review(run_id: str = typer.Argument(..., help="Run ID to review.")) -> None:
-    """Write drafts to disk and open them in $EDITOR."""
-    _not_implemented("review")
+def review_cmd(run_id: str = typer.Argument(..., help="Run ID to review.")) -> None:
+    """Write drafts to disk as editable markdown; open the directory in $EDITOR."""
+
+    def _impl() -> None:
+        path = review_module.write_drafts_to_disk(run_id)
+        typer.echo(f"Wrote drafts to {path}")
+        editor = os.environ.get("EDITOR")
+        if editor:
+            try:
+                subprocess.run([editor, str(path)], check=False)
+            except FileNotFoundError:
+                typer.echo(
+                    f"Could not launch $EDITOR ({editor!r}). Edit the files yourself."
+                )
+        else:
+            typer.echo(
+                "Open the files in your editor of choice (set $EDITOR to auto-launch)."
+            )
+        typer.echo(
+            f"When you're done editing, run `scholar approve {run_id}` to sync your changes."
+        )
+
+    _run_safely(_impl)
 
 
 @app.command("approve")
-def approve(
+def approve_cmd(
     run_id: str = typer.Argument(..., help="Run ID to approve drafts for."),
     only: str | None = typer.Option(
-        None, "--only", help="Approve only the draft with this slug."
+        None,
+        "--only",
+        help="Approve only the draft whose filename slug matches this value.",
     ),
 ) -> None:
-    """Mark drafts as approved (ready for send)."""
-    _not_implemented("approve")
+    """Set status: approved on drafts (in their .md files) and sync to the DB."""
+
+    def _impl() -> None:
+        settings = load_settings()
+        drafts_dir = settings.drafts_root / run_id
+        if not drafts_dir.exists():
+            raise NotFoundError(
+                f"No drafts directory at {drafts_dir} for run {run_id}. "
+                f"Run `scholar review {run_id}` first."
+            )
+
+        if only:
+            target_files = [drafts_dir / f"{only}.md"]
+            if not target_files[0].exists():
+                raise NotFoundError(
+                    f"No draft file matching slug {only!r} in {drafts_dir}"
+                )
+        else:
+            target_files = sorted(drafts_dir.glob("*.md"))
+
+        approved_in_file = 0
+        for fp in target_files:
+            try:
+                parsed = review_module.parse_draft_file(fp)
+            except Exception as e:
+                typer.echo(f"WARNING: {fp.name}: {e}", err=True)
+                continue
+            if parsed.status.strip().lower() == "pending_review":
+                review_module.write_status_in_file(fp, "approved")
+                approved_in_file += 1
+
+        typer.echo(
+            f"Marked {approved_in_file} draft file(s) as approved. "
+            f"Syncing to DB..."
+        )
+
+        report = review_module.sync_drafts_from_disk(run_id)
+        typer.echo("")
+        typer.echo(report.summary())
+
+    _run_safely(_impl)
 
 
 @app.command("status")

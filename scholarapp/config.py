@@ -62,6 +62,19 @@ class Settings:
     def runs_dir(self) -> Path:
         return self.data_dir / "runs"
 
+    @property
+    def drafts_root(self) -> Path:
+        """Where editable draft .md files are written.
+
+        Defaults to `<cwd>/drafts/` so files show up in Finder / file explorers
+        (Mac hides `~/.scholarapp/` by default). Override with `DRAFTS_DIR` if you
+        want them somewhere else.
+        """
+        raw = os.environ.get("DRAFTS_DIR")
+        if raw:
+            return Path(raw).expanduser().resolve()
+        return (Path.cwd() / "drafts").resolve()
+
 
 def load_settings() -> Settings:
     """Read env vars and return a fresh Settings."""
