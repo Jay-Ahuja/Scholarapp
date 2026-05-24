@@ -342,6 +342,6 @@ cache and produces no `parse_resume` row.
 | 6 | [`06-drafting.md`](06-drafting.md) | Email drafting with prompt caching |
 | 7 | [`07-review.md`](07-review.md) | Editable markdown draft files |
 | 8 | [`08-delivery.md`](08-delivery.md) | Gmail OAuth + the SEND_ENABLED gate |
-| 9 | `09-smoke-test.md` (to be written) | End-to-end test + top-level README polish |
+| 9 | [`09-smoke-test.md`](09-smoke-test.md) | End-to-end test + top-level README polish |
 
 The prompts to give an agent for each step live in [`implementation-prompts.md`](../implementation-prompts.md) at the repo root.

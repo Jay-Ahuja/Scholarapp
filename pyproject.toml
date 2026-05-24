@@ -27,6 +27,7 @@ dependencies = [
 dev = [
     "pytest>=8.0",
     "ruff>=0.5",
+    "vcrpy>=6.0",
 ]
 
 [project.scripts]
@@ -52,4 +53,9 @@ select = ["E", "F", "I", "UP", "B"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q"
+# Skip @pytest.mark.record tests by default — they hit real APIs.
+# Run with: pytest -m record tests/test_e2e_recording.py
+addopts = "-q -m 'not record'"
+markers = [
+    "record: tests that hit real APIs to refresh vcrpy cassettes (opt-in)",
+]

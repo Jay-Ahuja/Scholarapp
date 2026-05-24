@@ -1,0 +1,3 @@
+# vcrpy cassettes for the e2e test land here.
+# Populate via: pytest -m record tests/test_e2e_recording.py
+# See docs/09-smoke-test.md.

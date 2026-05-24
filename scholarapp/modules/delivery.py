@@ -214,8 +214,8 @@ def send_approved(run_id: str) -> DeliveryReport:
                 )
                 report.send_disabled += 1
         raise SendingDisabled(
-            f"{report.send_disabled} draft(s) would have been sent. "
-            "SEND_ENABLED is false; no email was actually sent. "
+            f"Sending disabled. {report.send_disabled} draft(s) would have been "
+            "sent but SEND_ENABLED is false; no email was actually sent. "
             "See docs/08-delivery.md for how to enable."
         )
 
