@@ -9,8 +9,8 @@ Implementation: [scholarapp/modules/review.py](../scholarapp/modules/review.py).
 Two entry points:
 
 - `write_drafts_to_disk(run_id) → Path` — materializes every Draft for a run as
-  a `.md` file under `~/.scholarapp/runs/<run_id>/drafts/`. Updates each
-  `Draft.file_path` to point at the new file. Idempotent.
+  a `.md` file under `<DRAFTS_DIR>/<run_id>/` (default `./drafts/<run_id>/`).
+  Updates each `Draft.file_path` to point at the new file. Idempotent.
 - `sync_drafts_from_disk(run_id) → SyncReport` — reads every `.md` in that
   directory, applies the editable fields to the DB, returns a typed report
   with counts and warnings.
@@ -163,7 +163,7 @@ approve`).
 - **No UI to build / no UI to maintain.** Adding a web UI would be a separate
   product. The CLI is the product.
 - **Easy to script.** Want to bulk-approve every draft that mentions "PhD"?
-  `grep -l PhD ~/.scholarapp/runs/<id>/drafts/*.md | xargs sed -i ...` →
+  `grep -l PhD drafts/<id>/*.md | xargs sed -i ...` →
   `scholar approve <id>`.
 
 ## Where files live + naming
@@ -224,7 +224,7 @@ warning, decide which side has the right version, and act. Multi-user setups
 
 ```bash
 scholar review 7dd7e616-4229-43bc-833e-7b9d24e1c4a8
-# → Wrote drafts to /Users/you/.scholarapp/runs/7dd7e616.../drafts
+# → Wrote drafts to /Users/you/path/to/project/drafts/7dd7e616...
 # → (launches $EDITOR on the directory if set)
 # → When you're done editing, run `scholar approve <run_id>` to sync your changes.
 ```

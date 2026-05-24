@@ -240,8 +240,9 @@ worse than false negatives (losing a legitimate candidate).
 ## Rate-limit notes
 
 - **OpenAlex** has no published per-day limit for polite-pool users, but it
-  recommends keeping concurrent requests modest. Our `CONCURRENCY = 10` semaphore
-  is well below anything they'll throttle.
+  recommends keeping concurrent requests modest. The per-stage Anthropic
+  concurrency semaphore (`settings.anthropic_concurrency`, default **3**) also
+  governs the per-author OpenAlex fan-out — well below anything they'd throttle.
 - **Tavily free tier** is around 1,000 requests/month at the time of writing. Each
   discovery run uses `count * 3` Tavily requests (one per candidate). A 10-person
   run = 30 requests. You can do ~30 runs/month on the free tier.

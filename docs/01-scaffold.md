@@ -79,40 +79,46 @@ Scholarapp/
 │   └── 09-smoke-test.md            # (Step 9) end-to-end test
 ├── scholarapp/
 │   ├── __init__.py                 # Package version
-│   ├── cli.py                      # Typer app with the seven commands
+│   ├── cli.py                      # Typer app — all 7 commands implemented
 │   ├── config.py                   # Env vars → immutable Settings
 │   ├── errors.py                   # Typed exceptions
+│   ├── ui.py                       # Rich-based CLI rendering (tables, spinners, panels)
+│   ├── usage.py                    # Per-call Anthropic token + cost tracker
 │   ├── db/
 │   │   ├── __init__.py             # Package marker
-│   │   ├── models.py               # (Step 2) SQLAlchemy models
-│   │   ├── session.py              # (Step 2) Engine + session context manager
-│   │   └── repo.py                 # (Step 2) Thin CRUD helpers
+│   │   ├── models.py               # SQLAlchemy models (Run/Professor/Project/MatchedProject/Draft/SendLog/ResumeCache)
+│   │   ├── session.py              # Engine + session context manager
+│   │   └── repo.py                 # Thin CRUD helpers
 │   ├── modules/
 │   │   ├── __init__.py             # Package marker
-│   │   ├── ingestion.py            # (Step 3)
-│   │   ├── discovery.py            # (Step 4)
-│   │   ├── matching.py             # (Step 5)
-│   │   ├── drafting.py             # (Step 6)
-│   │   ├── review.py               # (Step 7)
-│   │   └── delivery.py             # (Step 8)
+│   │   ├── ingestion.py            # Step 3 — resume + prompt parsing
+│   │   ├── discovery.py            # Step 4 — OpenAlex + Tavily
+│   │   ├── matching.py             # Step 5 — pick relevant projects
+│   │   ├── drafting.py             # Step 6 — write personalized emails
+│   │   ├── review.py               # Step 7 — markdown draft files
+│   │   └── delivery.py             # Step 8 — Gmail send (gated)
 │   └── prompts/
 │       ├── __init__.py             # Package marker (so importlib.resources works)
-│       ├── parse_resume.txt        # (Step 3)
-│       ├── parse_prompt.txt        # (Step 3)
-│       ├── match_projects.txt      # (Step 5)
-│       └── draft_email.txt         # (Step 6)
-└── tests/                          # (Steps 3–9) pytest suites
-    ├── conftest.py                 # (Step 9) shared fixtures
-    ├── fixtures/                   # (Step 9) sample resume, prompt, template
-    ├── cassettes/                  # (Step 9) vcrpy recordings
-    ├── test_ingestion.py           # (Step 3)
-    ├── test_discovery.py           # (Step 4)
-    ├── test_matching.py            # (Step 5)
-    ├── test_drafting.py            # (Step 6)
-    ├── test_review.py              # (Step 7)
-    ├── test_delivery.py            # (Step 8)
-    ├── test_e2e.py                 # (Step 9)
-    └── test_e2e_recording.py       # (Step 9)
+│       ├── parse_resume.txt        # Step 3
+│       ├── parse_prompt.txt        # Step 3
+│       ├── pick_topics.txt         # Step 4 — OpenAlex topic selection
+│       ├── extract_email.txt       # Step 4 — email extraction from web snippets
+│       ├── match_projects.txt      # Step 5
+│       └── draft_email.txt         # Step 6
+└── tests/
+    ├── conftest.py                 # Step 9 — shared fixtures + vcrpy config
+    ├── fixtures/                   # Step 9 — sample_resume.pdf / sample_prompt.md / sample_template.md
+    ├── cassettes/                  # Step 9 — vcrpy recordings (populate via `pytest -m record`)
+    ├── test_ingestion.py           # Step 3
+    ├── test_discovery.py           # Step 4
+    ├── test_matching.py            # Step 5
+    ├── test_drafting.py            # Step 6
+    ├── test_review.py              # Step 7
+    ├── test_delivery.py            # Step 8
+    ├── test_e2e.py                 # Step 9 — cassette replay
+    ├── test_e2e_recording.py       # Step 9 — real-API recording (opt-in)
+    ├── test_ui.py                  # Rich rendering tests
+    └── test_usage.py               # Token-tracker tests
 ```
 
 Separately, Scholarapp creates the following on first run (outside the repo):

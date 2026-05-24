@@ -185,7 +185,7 @@ pending_review ──────┼──> approved ─┬──> sent         
 - `approved` — user set this in the markdown file (Step 7) or via `scholar approve`.
 - `rejected` — user dropped this draft from the run.
 - `sent` — Gmail accepted the message and returned a `gmail_message_id`.
-- `send_disabled` — `scholar send` was invoked while `SEND_ENABLED=false`; the SendLog is written but the draft status is **not** changed by the gated path. (Set this status only when sending is actually enabled and the gate intercepts a single draft for some other reason — current code logs and leaves status untouched. See Step 8 doc when written.)
+- `send_disabled` — `scholar send` was invoked while `SEND_ENABLED=false`; the SendLog is written but the draft status is **not** changed by the gated path. (See [docs/08-delivery.md](08-delivery.md) for the gate's full semantics.)
 - `approved → pending_review` is allowed (Step 7) so the user can pull a draft back from the approval queue.
 - `sent → anything` is rejected by the Step 7 sync.
 
