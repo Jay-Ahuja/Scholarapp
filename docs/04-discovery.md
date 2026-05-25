@@ -89,11 +89,14 @@ exhausted. See the next section.
 
 ## The count guarantee and the discovery top-up loop
 
-A `scholar run` either produces **exactly** the requested `count` of personalized
-drafts, or it **fails loudly** — it never silently delivers fewer. This is a property
-of the *pipeline*, not of `find_professors` alone. `find_professors` is best-effort
-and returns "up to `count`"; the guarantee is enforced by the orchestration in
-[scholarapp/cli.py](../scholarapp/cli.py) `run()`.
+A `scholar run` tries to produce **exactly** the requested `count` of personalized
+drafts. When the field can supply that many matchable professors it does; when it
+**falls short**, the run **delivers what it matched** — a successful *partial delivery*
+that ends in the normal review state with a clear shortfall warning, never a hard
+failure. This is a property of the *pipeline*, not of `find_professors` alone.
+`find_professors` is best-effort and returns "up to `count`"; the top-up orchestration
+in [scholarapp/cli.py](../scholarapp/cli.py) `run()` drives toward the target and
+decides what to draft when the field runs dry.
 
 ### Why a loop is needed: two drop points
 
@@ -124,16 +127,19 @@ parse → discover (pass 1) → match (pass 1) ──┐
                   ┌──────────────────────┴───────────────────────┐
                   │ yes                                        no  │
                   ▼                                                ▼
-   discover shortfall (exclude seen IDs)              ── exact-N gate ──
-   → match new professors → recompute have            have < count → FAIL LOUDLY
-   → loop                                              have ≥ count → draft exactly count
+   discover shortfall (exclude seen IDs)              ── partial-delivery gate ──
+   → match new professors → recompute have            have < count → warn, draft the
+   → loop (until target / exhaustion /                              `have` we matched
+     5 empty batches / pass cap)                      have ≥ count → draft exactly count
+                                                       (either way → end in REVIEW)
 ```
 
 The loop **checkpoints AFTER matching and BEFORE drafting**: the `have` it compares
 against `count` is the number of professors with ≥1 matched project — exactly the set
 drafting keeps. This is computed by `_count_professors_with_matches(run_id)`. Checking
 *after* matching is what lets the loop see the no-project-match skip and top up for it,
-and it means the fail-loud gate trips **before** any Sonnet (drafting) spend.
+and it means the loop spends **no** Sonnet (drafting) tokens chasing the count — drafting
+only starts once the loop has settled on the professors it will deliver.
 
 Each pass is two persisted steps, factored into helpers so the initial pass and every
 top-up share code:
@@ -166,54 +172,71 @@ unaffected.
 
 ### Termination conditions
 
-The loop in `run()` stops as soon as any of these holds:
+The loop in `run()` stops as soon as any of these holds. **None of them is fatal** — a
+stop short of `count` falls through to partial delivery (next section):
 
 1. **Target reached** — `have >= count`. The loop condition (`while have < count`) is
    false. The run proceeds to draft exactly `count`.
 2. **Field exhausted** — a top-up pass returns **zero new candidates**
-   (`find_professors` found no new qualifying authors), or it discovered professors but
-   **none gained a match** (`new_have <= have`). Either way there's no progress to be
-   had, so the loop breaks rather than spin.
-3. **Runaway guard** — `MAX_DISCOVERY_PASSES = 10` (1 initial pass + up to 9 top-ups).
-   In practice the zero-new-qualifiers termination fires first; this constant only
-   bounds pathological non-progress the other checks miss.
-4. **Mid-loop error** — a `DiscoveryError` or `MatchingError` raised *inside* a top-up
+   (`find_professors` found no new qualifying authors). With nothing left to discover
+   there's no progress to be had, so the loop breaks immediately. This is the *genuine
+   exhaustion* case and is **not** counted toward the empty-batch streak below.
+3. **Empty-batch streak** — a pass that *did* surface new, previously-unseen professors
+   but added **zero newly-matched** professors (`new_have <= have` — they all had no
+   matchable project) is an "empty batch". A single empty batch no longer stops the
+   search: the loop tolerates up to `MAX_EMPTY_TOPUP_BATCHES = 5` **consecutive** empty
+   batches before giving up. The streak (`empty_batches`) **resets to 0** the moment any
+   pass adds at least one new match (`new_have > have`), so the loop keeps reaching for
+   matchable professors that are still out there instead of quitting on the first dry
+   pass. It breaks only when the streak hits 5 in a row.
+4. **Runaway guard** — `MAX_DISCOVERY_PASSES = 10` (1 initial pass + up to 9 top-ups).
+   In practice the exhaustion / empty-streak terminations fire first; this constant only
+   bounds pathological non-progress the other checks miss. When it trips it `break`s into
+   the same partial-delivery path — it is **not** a hard failure.
+5. **Mid-loop error** — a `DiscoveryError` or `MatchingError` raised *inside* a top-up
    pass (e.g., Tavily quota exhausted mid-run) **breaks** the loop quietly. It does not
-   mark the run FAILED or re-raise on its own; it lets the exact-N gate below decide the
-   run's fate (which will be a loud failure if still short). The initial pass keeps the
-   old fatal-on-error behavior — a discovery/matching error there marks the run FAILED
-   and re-raises immediately.
+   mark the run FAILED or re-raise on its own; it lets the partial-delivery gate below
+   draft whatever matched so far. The initial pass keeps the old fatal-on-error behavior
+   — a discovery/matching error there marks the run FAILED and re-raises immediately.
 
-### The fail-loudly gate
+### The partial-delivery gate
 
 After the loop, before drafting:
 
-- If `have < count` and the run will draft, `run()` marks the run **FAILED** (with a
-  `count unreachable: ...` error) and raises `CountUnreachableError`
-  ([scholarapp/errors.py](../scholarapp/errors.py)). The CLI's `_run_safely` renders it
-  and exits **non-zero**. **No Sonnet is spent** on a run it can't complete.
-- The professors and matches discovered along the way **stay persisted** — they're not
-  rolled back. A rerun (or a lower `count` / broader field) can build on them, and
-  `scholar status <run_id>` still shows the partial state.
-- If `have >= count`, the run advances to DRAFTING and drafts **exactly** `count`. The
-  draft-collection loop caps at `count` because a generous top-up pass can overshoot
-  (it may surface more matchable professors than the shortfall strictly needed).
+- If `have < count`, the run does a **partial delivery**: it `ui.warn`s a clear
+  shortfall message (`Found {have} of {count} professors with a matched project.
+  Drafting the {have} we have. …`), then advances to DRAFTING and drafts the professors
+  it *did* match. A shortfall is **not** fatal — the run finishes normally, ends in
+  `RunStatus.REVIEW` like any other run, and exits **zero**. There is no longer a hard
+  "count unreachable" failure here.
+- If `have >= count`, the run logs that it reached the target, advances to DRAFTING, and
+  drafts **exactly** `count`.
+- Either way, drafting **caps at `count`** and **never drafts a professor with no
+  matched project**: the draft-collection loop breaks once it has gathered `count`
+  requests (a generous top-up pass can overshoot) and skips any professor whose matched
+  set is empty.
+- The professors and matches discovered along the way **stay persisted**. A rerun (or a
+  lower `count` / broader field) can build on them, and `scholar status <run_id>` shows
+  the full state.
 
-`CountUnreachableError` subclasses `ScholarError`, so it's caught by the same CLI
-handler as the other pipeline errors; it exists as its own type purely so this
-"can't reach the count" condition is distinguishable from a discovery/matching failure.
+Note that this non-fatal path applies only to the *top-up shortfall*. The **initial**
+discovery/matching pass still fails fatally on a real error (a missing topic, an API
+failure, etc.) — those mark the run FAILED and re-raise. `CountUnreachableError` has
+been **removed** from [scholarapp/errors.py](../scholarapp/errors.py); no code path
+raises it anymore.
 
 ### Interaction with `--stop-after`
 
 - `--stop-after matching` runs the **full** top-up loop (so you get the real count it
-  can reach), then halts. Because no drafts are produced, a shortfall is reported as a
-  **warning, not a failure** — the run is not marked FAILED and the exit code is 0.
+  can reach), then halts before drafting. A shortfall is reported as a **warning** and
+  the exit code is 0 (unchanged).
 - `--stop-after parse` and `--stop-after discovery` are unchanged by this feature: they
   return before matching, so the loop and the gate never run. (`--stop-after discovery`
   still runs only the single initial discovery pass.)
 
-The gate keys off `producing_drafts = stop_after is None`: only a run that will actually
-draft fails loudly on a shortfall; the cheaper exploration modes warn.
+A shortfall is non-fatal in **every** mode now: `--stop-after matching` warns and stops,
+and a full run warns and delivers the drafts it has. (There is no longer a
+`producing_drafts` branch — the old gate that failed loudly only when drafting is gone.)
 
 ## OpenAlex endpoints used
 
@@ -331,7 +354,8 @@ parallel. Why over-fetch?
 If fewer than `count` survive, `find_professors` logs a warning and returns what we
 have rather than failing — a single pass is best-effort by design. This is **not** the
 end of the story: the CLI top-up loop re-invokes `find_professors` to make up the
-shortfall, and only fails loudly if the field genuinely can't supply enough (see
+shortfall, and if the field genuinely can't supply enough it delivers the matches it
+*did* find (a partial delivery, see
 [The count guarantee and the discovery top-up loop](#the-count-guarantee-and-the-discovery-top-up-loop)).
 Over-fetching still matters — it keeps the common case to a single pass instead of
 forcing a second round of paid lookups.
@@ -467,8 +491,8 @@ worse than false negatives (losing a legitimate candidate).
   **Both helpers use `claude-haiku-4-5`** (constant `discovery.MODEL_HAIKU`) — they're
   narrow extraction tasks where Haiku performs at parity with Sonnet for ~⅓ the cost.
   A single-pass 3-professor run lands at ~$0.025 of Claude spend. Note the top-up loop
-  itself spends **no** drafting (Sonnet) tokens — the exact-N gate fails before drafting
-  if the count is unreachable.
+  itself spends **no** drafting (Sonnet) tokens — drafting starts only after the loop
+  settles, so a short field costs Sonnet only for the professors actually delivered.
 - The `_request_with_retry` helper retries 429 + 5xx with exponential backoff (1s,
   2s, 4s) and honors `Retry-After`. Three attempts max; the third failure raises.
 
@@ -479,8 +503,8 @@ worse than false negatives (losing a legitimate candidate).
 | `OpenAlex returned no topics for field 'comp neuro'` | Field is too colloquial | Try the standard term: `"computational neuroscience"` |
 | `Could not match field 'X' to an OpenAlex topic` | Topics found but LLM rejected all | The pick prompt got too strict — try a synonym, or relax the prompt |
 | `OpenAlex returned no authors for field 'X'` | Topic matched but no qualifying authors | Topic is too narrow / too new; broaden the field |
-| `Wanted N professors but only M survived...` (log warning, single pass) | Email resolution drop rate higher than expected on that pass | Informational — the CLI top-up loop will discover more. Persistent shortfall surfaces as `CountUnreachableError` below |
-| `Found M of N professors with a matched project. Cannot draft...` (`CountUnreachableError`, exit 1, run FAILED) | The field can't supply `count` professors with both an academic email and a matchable project, even after top-up | Broaden the field, lower the count, or rerun later. Discovered professors + matches stay saved. Raised before any drafting (Sonnet) spend |
+| `Wanted N professors but only M survived...` (log warning, single pass) | Email resolution drop rate higher than expected on that pass | Informational — the CLI top-up loop will discover more. A persistent shortfall surfaces as the partial-delivery warning below |
+| `Found M of N professors with a matched project. Drafting the M we have.` (warning, exit 0, run ends in REVIEW) | The field couldn't supply `count` professors with both an academic email and a matchable project, even after top-up | This is a successful **partial delivery**, not a failure: the M matched professors are drafted. To get closer to `count`, broaden the field, lower the count, or rerun later. Discovered professors + matches stay saved |
 | `ANTHROPIC_API_KEY is not set` / `TAVILY_API_KEY is not set` | Missing env var | Add to `.env` |
 | `Tavily returned 429 (rate limit / quota exhausted)...` | Monthly Tavily quota used up (free tier ~1000/month) | Wait until next billing cycle, lower the requested count, or upgrade. A run uses `count × 3` Tavily requests. |
 | Retried HTTP 429/503 still failing (OpenAlex) | Upstream actually unavailable | Wait + retry the run; check OpenAlex status |
