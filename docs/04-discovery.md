@@ -181,7 +181,10 @@ top-up share code:
   by **every** author the pass paid to enrich — not just the survivors in `candidates`.
 - `_match_and_persist(professor_ids=...)` → matches **only** the newly persisted
   professors (so a top-up never re-matches and re-pays for professors matched in an
-  earlier pass), persisting their matched projects.
+  earlier pass), persisting their matched projects. When a top-up pass persists **no**
+  new professor (every pulled author dropped at email validation), the loop **skips this
+  step entirely** — guarded by `if topup_prof_ids:` — since there is nothing to match;
+  the pass still counts toward the empty-batch streak.
 
 ### The `exclude_ids` contract (how passes make progress)
 
@@ -203,8 +206,10 @@ this:
   `seen_openalex_ids.update(topup_attempted_ids)` (each top-up). Crucially, the top-up
   update runs **before** the field-exhaustion check — so a pass that paid to enrich
   authors but produced **no** email-validated survivor still records its pool, and the
-  next pass won't re-pull it. (A pass that surfaces no *new* authors at all returns an
-  empty `attempted_ids`, which is also the field-exhaustion signal.)
+  next pass won't re-pull it. That survivor-less pass is **not** exhaustion: it had a
+  non-empty `attempted_ids`, so it keeps the loop going (counted toward the empty-batch
+  streak). The field-exhaustion signal is the opposite — a pass that surfaces no *new*
+  authors at all, so its `attempted_ids` is **empty** (and the update above is a no-op).
 - `find_professors` drops excluded authors via `_filter_excluded` **BEFORE enrichment**,
   so an already-seen author costs **no** Tavily search and **no** Haiku call — and, being
   filtered out before enrichment, an excluded author never re-enters `attempted_ids`.
@@ -225,22 +230,36 @@ stop short of `count` falls through to partial delivery (next section):
 
 1. **Target reached** — `have >= count`. The loop condition (`while have < count`) is
    false. The run proceeds to draft exactly `count`.
-2. **Field exhausted** — a top-up pass returns **zero new candidates**
-   (`find_professors.professors` is empty — no new author survived email validation).
-   With nothing left to deliver there's no progress to be had, so the loop breaks. This
-   is the *genuine exhaustion* case and is **not** counted toward the empty-batch streak
-   below. Note the loop folds that pass's `attempted_ids` into `seen_openalex_ids`
-   **before** this check, so even a survivor-less pass that *did* pay to enrich some
-   authors records its pool first — but if the pass surfaced no authors at all (true
-   exhaustion) `attempted_ids` is empty and the update is a no-op.
-3. **Empty-batch streak** — a pass that *did* surface new, previously-unseen professors
-   but added **zero newly-matched** professors (`new_have <= have` — they all had no
-   matchable project) is an "empty batch". A single empty batch no longer stops the
-   search: the loop tolerates up to `MAX_EMPTY_TOPUP_BATCHES = 5` **consecutive** empty
-   batches before giving up. The streak (`empty_batches`) **resets to 0** the moment any
-   pass adds at least one new match (`new_have > have`), so the loop keeps reaching for
-   matchable professors that are still out there instead of quitting on the first dry
-   pass. It breaks only when the streak hits 5 in a row.
+2. **Field exhausted** — a top-up pass surfaces **no new authors at all**: its
+   `attempted_ids` is **empty** (nothing pulled, nothing paid for). Only this signals
+   genuine exhaustion — OpenAlex, after the exclude filter, had no fresh author left to
+   hand back — so the loop breaks (`if not topup_attempted_ids: break`). This is the
+   *genuine exhaustion* case and is **not** counted toward the empty-batch streak below.
+   Note the loop folds that pass's `attempted_ids` into `seen_openalex_ids` **before**
+   this check; when `attempted_ids` is empty the update is a harmless no-op.
+
+   A pass that **did** pull new authors but produced **no email-validated survivor**
+   (every author dropped at email validation) is **not** exhaustion: it spent money
+   exploring deeper ranks, so its `attempted_ids` is non-empty and the loop keeps going,
+   counting the pass toward the empty-batch streak below. The stop signal is "discovery
+   found nobody new," never "this pass had no survivors."
+3. **Empty-batch streak** — a **non-productive pass** is one that pulled new authors
+   (non-empty `attempted_ids`) but added **zero newly-matched** professors
+   (`new_have <= have`). Two distinct causes are folded into this one bucket and treated
+   **uniformly** — each counts as exactly one non-productive pass:
+   - **(a) zero survivors** — every pulled author was dropped at email validation, so no
+     new professor was persisted. When this happens the match step is **skipped**
+     entirely (the `if topup_prof_ids:` guard — there is nothing to match), and the pass
+     still counts toward the streak.
+   - **(b) survivors matched no project** — new professors were persisted and matched,
+     but none gained a matchable project, so `have` didn't grow.
+
+   A single non-productive pass no longer stops the search: the loop tolerates up to
+   `MAX_EMPTY_TOPUP_BATCHES = 5` **consecutive** such passes before giving up. The streak
+   (`empty_batches`) **resets to 0** the moment any pass adds at least one new match
+   (`new_have > have`), so the loop keeps reaching for matchable professors that are still
+   out there instead of quitting on the first dry pass. It breaks only when the streak
+   hits 5 in a row.
 4. **Runaway guard** — `MAX_DISCOVERY_PASSES = 10` (1 initial pass + up to 9 top-ups).
    In practice the exhaustion / empty-streak terminations fire first; this constant only
    bounds pathological non-progress the other checks miss. When it trips it `break`s into
