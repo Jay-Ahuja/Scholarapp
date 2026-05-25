@@ -477,9 +477,10 @@ def run(
         # --- Top-up loop -------------------------------------------------------
         # Checkpoint AFTER matching, BEFORE drafting. Keep discovering+matching
         # NEW professors until we have `count` with a match, the field is
-        # exhausted (a pass yields zero new candidates), MAX_EMPTY_TOPUP_BATCHES
-        # consecutive passes add no new matched professor, or the runaway guard
-        # trips. None of these is fatal: on shortfall we deliver partially below.
+        # exhausted (a pass surfaces zero new authors at all — empty
+        # attempted_ids), MAX_EMPTY_TOPUP_BATCHES consecutive passes add no new
+        # matched professor, or the runaway guard trips. None of these is fatal:
+        # on shortfall we deliver partially below.
         # Mid-loop DiscoveryError/MatchingError break the loop quietly.
         passes = 1  # the initial pass above counts as pass 1
         empty_batches = 0  # consecutive top-up passes that added no new match
@@ -527,24 +528,34 @@ def run(
             # the next pass must not re-pull it.
             seen_openalex_ids.update(topup_attempted_ids)
 
-            if not topup_candidates:
-                # Field exhausted — no NEW qualifying authors surfaced this pass.
+            if not topup_attempted_ids:
+                # Genuine field exhaustion — discovery surfaced NO new authors at
+                # all this pass (nothing pulled, nothing paid for). Stop. A pass
+                # that DID pull authors but had them all dropped at email
+                # validation is NOT exhaustion: it has explored deeper ranks and
+                # is handled by the empty-batch streak below.
                 ui.info("[dim]No new professors available — field exhausted.[/dim]")
                 break
-            ui.professors_table(topup_candidates)
 
-            try:
-                with ui.spinner(
-                    f"Matching projects for {len(topup_prof_ids)} new professors..."
-                ):
-                    _match_and_persist(
-                        professor_ids=topup_prof_ids,
-                        interests=interests,
-                        experiences_text=experiences_text,
-                    )
-            except (DiscoveryError, MatchingError) as e:
-                ui.warn(f"Top-up matching stopped early: {e}")
-                break
+            # New authors were pulled this pass. Match only the newly-persisted
+            # professors. If every pulled author was dropped at email validation
+            # (no new professor persisted), skip the match step entirely — there
+            # is nothing to match — and let the non-productive-pass logic below
+            # count this toward the empty-batch streak.
+            if topup_prof_ids:
+                ui.professors_table(topup_candidates)
+                try:
+                    with ui.spinner(
+                        f"Matching projects for {len(topup_prof_ids)} new professors..."
+                    ):
+                        _match_and_persist(
+                            professor_ids=topup_prof_ids,
+                            interests=interests,
+                            experiences_text=experiences_text,
+                        )
+                except (DiscoveryError, MatchingError) as e:
+                    ui.warn(f"Top-up matching stopped early: {e}")
+                    break
 
             new_have = _count_professors_with_matches(run_id)
             if new_have > have:
@@ -554,9 +565,12 @@ def run(
                 empty_batches = 0
                 continue
 
-            # This pass added professors but none qualified (no matchable
-            # projects). Count it toward the consecutive-empty streak; only stop
-            # once the streak reaches MAX_EMPTY_TOPUP_BATCHES.
+            # Non-productive pass: this pass pulled new authors but added no
+            # newly-matched professor. Either every pulled author was dropped at
+            # email validation (no survivors to match), or survivors matched no
+            # project. Both causes are treated UNIFORMLY — each counts one toward
+            # the same consecutive-empty streak; only stop once the streak reaches
+            # MAX_EMPTY_TOPUP_BATCHES.
             have = new_have
             empty_batches += 1
             if empty_batches >= MAX_EMPTY_TOPUP_BATCHES:

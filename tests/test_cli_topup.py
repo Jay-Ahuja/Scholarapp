@@ -540,6 +540,185 @@ def test_topup_streak_resets_after_four_empty_then_matching(e2e_setup, monkeypat
 
 
 # ---------------------------------------------------------------------------
+# (c.2) Zero-survivor passes (authors pulled but all email-dropped) do NOT stop
+#       the loop; only an empty attempted_ids (no authors pulled) is exhaustion.
+# ---------------------------------------------------------------------------
+
+
+class _ScriptedDiscovery:
+    """Per-call scripted (survivor_slugs, attempted_slugs) — decoupled.
+
+    Each scripted entry is `(survivors, attempted)`:
+      - `survivors`: slugs that survive email validation → returned candidates.
+      - `attempted`: every author this pass pulled+paid to enrich (survivors +
+        email-less discards) → the DiscoveryResult's `attempted_ids`.
+    A pass with `survivors=[]` but `attempted=[...]` models "pulled new authors
+    but all dropped at email validation" — NOT field exhaustion. A pass with
+    `attempted=[]` models genuine exhaustion (no new author surfaced at all).
+    Once the script is exhausted, every further call returns `([], [])`.
+    `exclude_ids` is recorded but does NOT re-filter — the script controls
+    novelty deterministically.
+    """
+
+    def __init__(self, script: list[tuple[list[str], list[str]]]):
+        self.script = script
+        self.calls: list[dict[str, Any]] = []
+
+    async def __call__(
+        self,
+        *,
+        field: str,
+        count: int,
+        user_interests: list[str],
+        exclude_ids: set[str] | None = None,
+    ) -> discovery.DiscoveryResult:
+        idx = len(self.calls)
+        self.calls.append(
+            {"field": field, "count": count, "exclude_ids": set(exclude_ids or set())}
+        )
+        survivors, attempted = (
+            self.script[idx] if idx < len(self.script) else ([], [])
+        )
+        cands = [_candidate(s) for s in survivors]
+        return discovery.DiscoveryResult(
+            professors=cands, attempted_ids=set(attempted)
+        )
+
+
+def test_topup_zero_survivor_pass_does_not_stop_then_reaches_count(
+    e2e_setup, monkeypatch
+):
+    """A pass that pulls authors but yields ZERO survivors keeps the loop going.
+
+    The all-email-dropped pass is NOT field exhaustion: its attempted_ids is
+    non-empty, so deeper ranks remain. The loop must continue and a later pass
+    with matchable professors reaches count.
+    """
+    inputs = e2e_setup["inputs"]
+    _mock_ingestion(monkeypatch, count=2)
+
+    # Pass 1 (initial): survivor a, qualifies → have=1.
+    # Pass 2 (top-up):  pulled b,c but BOTH email-dropped → zero survivors. This
+    #                   must NOT stop the loop (attempted_ids = {b, c}).
+    # Pass 3 (top-up):  survivor d, qualifies → have=2 → reached count.
+    script = [
+        (["a"], ["a"]),
+        ([], ["b", "c"]),
+        (["d"], ["d"]),
+    ]
+    fake_disc = _ScriptedDiscovery(script)
+    fake_match = _FakeMatching(qualifying={"a", "d"})
+    fake_draft = _FakeDrafting()
+    monkeypatch.setattr(discovery, "find_professors", fake_disc)
+    monkeypatch.setattr(matching, "match_projects_for_run", fake_match)
+    monkeypatch.setattr(drafting, "draft_emails_for_run", fake_draft)
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["run", "--inputs", str(inputs)])
+
+    assert result.exit_code == 0, result.output
+    # The zero-survivor pass did NOT stop the loop: a third discovery happened.
+    assert len(fake_disc.calls) == 3
+    # The zero-survivor pass excluded both pulled-but-dropped authors next pass.
+    assert fake_disc.calls[2]["exclude_ids"] >= {"a", "b", "c"}
+    # Match was never called with an empty professor list: only 2 matched drafts.
+    assert fake_draft.request_counts == [2]
+
+    with get_session() as session:
+        run = _the_run(session)
+        assert run.status == RunStatus.REVIEW
+        drafts = repo.list_drafts_for_run(session, run.id)
+    assert len(drafts) == 2
+
+
+def test_topup_empty_attempted_ids_is_genuine_exhaustion(e2e_setup, monkeypatch):
+    """A pass whose attempted_ids is empty (no author pulled) stops the loop."""
+    inputs = e2e_setup["inputs"]
+    _mock_ingestion(monkeypatch, count=3)
+
+    # Pass 1 (initial): survivor a, qualifies → have=1.
+    # Pass 2 (top-up):  NOTHING pulled at all (attempted_ids empty) → exhaustion.
+    script = [
+        (["a"], ["a"]),
+        ([], []),
+        # A further matching batch is scripted but must NEVER be requested: the
+        # empty-attempted pass stops the loop first.
+        (["z"], ["z"]),
+    ]
+    fake_disc = _ScriptedDiscovery(script)
+    fake_match = _FakeMatching(qualifying={"a", "z"})
+    fake_draft = _FakeDrafting()
+    monkeypatch.setattr(discovery, "find_professors", fake_disc)
+    monkeypatch.setattr(matching, "match_projects_for_run", fake_match)
+    monkeypatch.setattr(drafting, "draft_emails_for_run", fake_draft)
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["run", "--inputs", str(inputs)])
+
+    assert result.exit_code == 0, result.output
+    # Exactly 2 discovery calls: the initial + the empty-attempted pass. The
+    # scripted matching batch (call 3) is never reached.
+    assert len(fake_disc.calls) == 2
+    assert "field exhausted" in result.output
+    # Partial delivery: only the single matched professor is drafted.
+    assert fake_draft.request_counts == [1]
+
+    with get_session() as session:
+        run = _the_run(session)
+        assert run.status == RunStatus.REVIEW
+        drafts = repo.list_drafts_for_run(session, run.id)
+    assert len(drafts) == 1
+
+
+def test_topup_five_zero_survivor_batches_stop_at_fifth(e2e_setup, monkeypatch):
+    """Five consecutive zero-survivor passes stop via the 5-streak, not the first.
+
+    Each top-up pulls fresh authors that are all email-dropped (zero survivors,
+    non-empty attempted_ids). This is the uniform empty-batch streak: the loop
+    must NOT stop on the first such pass — only after 5 consecutive ones.
+    """
+    inputs = e2e_setup["inputs"]
+    _mock_ingestion(monkeypatch, count=3)
+
+    # Pass 1 (initial): survivor a, qualifies → have=1.
+    # Top-ups 1..5: each pulls fresh authors that are ALL email-dropped (zero
+    # survivors). Each counts one toward the streak; the 5th trips the cap.
+    script = [
+        (["a"], ["a"]),
+        ([], ["b1", "b2"]),  # top-up 1 — zero-survivor, streak=1
+        ([], ["c1", "c2"]),  # top-up 2 — zero-survivor, streak=2
+        ([], ["d1", "d2"]),  # top-up 3 — zero-survivor, streak=3
+        ([], ["e1", "e2"]),  # top-up 4 — zero-survivor, streak=4
+        ([], ["f1", "f2"]),  # top-up 5 — zero-survivor, streak=5 → STOP
+        ([], ["g1", "g2"]),  # should never be requested
+    ]
+    fake_disc = _ScriptedDiscovery(script)
+    fake_match = _FakeMatching(qualifying={"a"})
+    fake_draft = _FakeDrafting()
+    monkeypatch.setattr(discovery, "find_professors", fake_disc)
+    monkeypatch.setattr(matching, "match_projects_for_run", fake_match)
+    monkeypatch.setattr(drafting, "draft_emails_for_run", fake_draft)
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["run", "--inputs", str(inputs)])
+
+    assert result.exit_code == 0, result.output
+    # 1 initial + exactly 5 zero-survivor top-ups, then the streak trips. The
+    # loop did NOT stop on the first zero-survivor pass. The 7th is never asked.
+    assert len(fake_disc.calls) == 6
+    # The match boundary was never invoked for a top-up (every pass had zero
+    # new professors), so only the initial pass's single match was drafted.
+    assert fake_match.matched_names == ["Prof a"]
+    assert fake_draft.request_counts == [1]
+
+    with get_session() as session:
+        run = _the_run(session)
+        assert run.status == RunStatus.REVIEW
+        drafts = repo.list_drafts_for_run(session, run.id)
+    assert len(drafts) == 1
+
+
+# ---------------------------------------------------------------------------
 # (d) --stop-after matching: loop runs, shortfall warns, no hard fail
 # ---------------------------------------------------------------------------
 
