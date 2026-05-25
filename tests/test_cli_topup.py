@@ -7,10 +7,14 @@ exact scenarios deterministically and assert on DB state + exit codes.
 What's covered (mirrors the orchestrator's verification list):
   (a) a short first pass triggers exclude-aware top-up passes that reach `count`,
       then drafts exactly `count`;
-  (b) field exhaustion (a pass returns zero new qualifying professors) raises
-      CountUnreachableError, exits non-zero, marks the run FAILED, drafts nothing;
+  (b) field exhaustion (a pass returns zero new candidates) is a PARTIAL delivery:
+      the run drafts the matched professors, exits 0, ends NOT FAILED, and warns;
+  (c) loop termination: one empty top-up batch then a matching batch reaches
+      `count`; five consecutive empty batches stop at the fifth pass; four empty
+      batches then a matching one resets the streak and keeps going;
   (d) `--stop-after matching` runs the loop and warns on shortfall (no hard fail);
-  (e) a top-up DiscoveryError breaks the loop, then the gate fails loudly.
+  (e) a top-up DiscoveryError breaks the loop, then partial delivery drafts what
+      matched.
 
 The discovery dedup / exclude-aware fetch unit behavior lives in test_discovery.py.
 """
@@ -260,12 +264,12 @@ def test_topup_reaches_count_and_drafts_exactly_n(e2e_setup, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# (b) Field exhausted → CountUnreachableError, non-zero exit, FAILED, no drafts
+# (b) Field exhausted → PARTIAL delivery: drafts what matched, exits 0, REVIEW
 # ---------------------------------------------------------------------------
 
 
-def test_field_exhausted_fails_loudly_before_drafting(e2e_setup, monkeypatch):
-    """Only 2 professors exist for a count=3 request → run FAILS, drafts nothing."""
+def test_field_exhausted_partial_delivery(e2e_setup, monkeypatch):
+    """Only 2 professors exist for a count=3 request → draft the 2, exit 0, warn."""
     inputs = e2e_setup["inputs"]
 
     # Pool has only 2 professors and both qualify. A later top-up pass returns [].
@@ -276,23 +280,172 @@ def test_field_exhausted_fails_loudly_before_drafting(e2e_setup, monkeypatch):
     runner = CliRunner()
     result = runner.invoke(app, ["run", "--inputs", str(inputs)])
 
-    # CountUnreachableError → non-zero exit. (Its message renders to stderr via
-    # ui.error; we assert its substance against the persisted run.error below.)
-    assert result.exit_code == 1, result.output
+    # A shortfall is a successful partial delivery, not a failure.
+    assert result.exit_code == 0, result.output
 
-    # No drafting was attempted (fail BEFORE any Sonnet spend).
-    assert fake_draft.request_counts == []
+    # Drafting ran on the 2 matched professors.
+    assert fake_draft.request_counts == [2]
+
+    # A shortfall warning was surfaced.
+    assert "Found 2 of 3" in result.output
 
     with get_session() as session:
         run = _the_run(session)
-        assert run.status == RunStatus.FAILED
-        assert run.error and "count unreachable" in run.error
-        assert "found 2 of 3" in run.error
+        # NOT FAILED — partial delivery ends in the normal REVIEW state.
+        assert run.status == RunStatus.REVIEW
         drafts = repo.list_drafts_for_run(session, run.id)
-        # The 2 discovered+matched professors persist; just no drafts.
         professors = repo.list_professors_for_run(session, run.id)
-    assert len(drafts) == 0
+    assert len(drafts) == 2
     assert len(professors) == 2
+
+
+# ---------------------------------------------------------------------------
+# (c) Loop termination: empty-batch streak, reset, and stop-at-fifth
+# ---------------------------------------------------------------------------
+
+
+class _BatchDiscovery:
+    """Returns an explicit, pre-scripted batch of candidates per call.
+
+    `batches` is an ordered list where each element is the list of slugs that
+    pass surfaces. A batch may contain slugs that won't qualify in matching
+    (an "empty" top-up batch) or `[]` to simulate genuine field exhaustion.
+    Once `batches` is exhausted, every further call returns `[]`. Slugs are
+    NOT re-filtered against `exclude_ids` — the script controls novelty — but
+    `exclude_ids` is still recorded for assertions.
+    """
+
+    def __init__(self, batches: list[list[str]]):
+        self.batches = batches
+        self.calls: list[dict[str, Any]] = []
+
+    async def __call__(
+        self,
+        *,
+        field: str,
+        count: int,
+        user_interests: list[str],
+        exclude_ids: set[str] | None = None,
+    ) -> list[discovery.ProfessorCandidate]:
+        idx = len(self.calls)
+        self.calls.append(
+            {"field": field, "count": count, "exclude_ids": set(exclude_ids or set())}
+        )
+        slugs = self.batches[idx] if idx < len(self.batches) else []
+        return [_candidate(s) for s in slugs]
+
+
+def test_topup_one_empty_then_matching_reaches_count(e2e_setup, monkeypatch):
+    """Initial short, one empty top-up batch, then a matching batch reaches count."""
+    inputs = e2e_setup["inputs"]
+    _mock_ingestion(monkeypatch, count=3)
+
+    # Pass 1 (initial): a,b,c → only `a` qualifies (have=1).
+    # Pass 2 (top-up):  d,e   → neither qualifies (empty batch; streak=1).
+    # Pass 3 (top-up):  f,g   → both qualify (have=3) → reached count.
+    batches = [["a", "b", "c"], ["d", "e"], ["f", "g"]]
+    fake_disc = _BatchDiscovery(batches)
+    fake_match = _FakeMatching(qualifying={"a", "f", "g"})
+    fake_draft = _FakeDrafting()
+    monkeypatch.setattr(discovery, "find_professors", fake_disc)
+    monkeypatch.setattr(matching, "match_projects_for_run", fake_match)
+    monkeypatch.setattr(drafting, "draft_emails_for_run", fake_draft)
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["run", "--inputs", str(inputs)])
+
+    assert result.exit_code == 0, result.output
+    # 3 discovery calls: initial + the empty batch + the matching batch.
+    assert len(fake_disc.calls) == 3
+    assert fake_draft.request_counts == [3]
+
+    with get_session() as session:
+        run = _the_run(session)
+        assert run.status == RunStatus.REVIEW
+        drafts = repo.list_drafts_for_run(session, run.id)
+    assert len(drafts) == 3
+
+
+def test_topup_five_consecutive_empty_batches_stop_at_fifth(e2e_setup, monkeypatch):
+    """Five consecutive empty top-up batches stop the search at the fifth pass."""
+    inputs = e2e_setup["inputs"]
+    _mock_ingestion(monkeypatch, count=3)
+
+    # Pass 1 (initial): a → qualifies (have=1). Passes 2..6 each surface fresh,
+    # non-qualifying candidates (5 consecutive empty batches). The 5th empty
+    # batch (pass 6, the 5th top-up) trips MAX_EMPTY_TOPUP_BATCHES and stops.
+    batches = [
+        ["a"],
+        ["b1", "b2"],  # top-up 1 — empty streak=1
+        ["c1", "c2"],  # top-up 2 — empty streak=2
+        ["d1", "d2"],  # top-up 3 — empty streak=3
+        ["e1", "e2"],  # top-up 4 — empty streak=4
+        ["f1", "f2"],  # top-up 5 — empty streak=5 → STOP
+        ["g1", "g2"],  # should never be requested
+    ]
+    fake_disc = _BatchDiscovery(batches)
+    fake_match = _FakeMatching(qualifying={"a"})  # only the initial qualifies
+    fake_draft = _FakeDrafting()
+    monkeypatch.setattr(discovery, "find_professors", fake_disc)
+    monkeypatch.setattr(matching, "match_projects_for_run", fake_match)
+    monkeypatch.setattr(drafting, "draft_emails_for_run", fake_draft)
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["run", "--inputs", str(inputs)])
+
+    assert result.exit_code == 0, result.output
+    # 1 initial + exactly 5 top-up passes, then the streak trips. The 7th batch
+    # is never requested.
+    assert len(fake_disc.calls) == 6
+    # Partial delivery: the single matched professor is drafted.
+    assert fake_draft.request_counts == [1]
+
+    with get_session() as session:
+        run = _the_run(session)
+        assert run.status == RunStatus.REVIEW
+        drafts = repo.list_drafts_for_run(session, run.id)
+    assert len(drafts) == 1
+
+
+def test_topup_streak_resets_after_four_empty_then_matching(e2e_setup, monkeypatch):
+    """Four empty batches then a matching one resets the streak and keeps going."""
+    inputs = e2e_setup["inputs"]
+    _mock_ingestion(monkeypatch, count=3)
+
+    # Pass 1 (initial): a → qualifies (have=1).
+    # Top-ups 1..4: non-qualifying (streak climbs to 4 — one short of the cap).
+    # Top-up 5: a matching batch → streak RESETS to 0, have=3, reached count.
+    # If the streak had NOT reset, a 5th empty batch would have stopped first;
+    # here the matching batch proves the reset by letting the run reach count.
+    batches = [
+        ["a"],
+        ["b1", "b2"],  # empty streak=1
+        ["c1", "c2"],  # empty streak=2
+        ["d1", "d2"],  # empty streak=3
+        ["e1", "e2"],  # empty streak=4
+        ["f1", "f2"],  # MATCHING → reset, have=3
+    ]
+    fake_disc = _BatchDiscovery(batches)
+    fake_match = _FakeMatching(qualifying={"a", "f1", "f2"})
+    fake_draft = _FakeDrafting()
+    monkeypatch.setattr(discovery, "find_professors", fake_disc)
+    monkeypatch.setattr(matching, "match_projects_for_run", fake_match)
+    monkeypatch.setattr(drafting, "draft_emails_for_run", fake_draft)
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["run", "--inputs", str(inputs)])
+
+    assert result.exit_code == 0, result.output
+    # 1 initial + 5 top-ups (4 empty + 1 matching). The loop did NOT stop at the
+    # 4th empty batch, proving the streak only trips at 5 CONSECUTIVE empties.
+    assert len(fake_disc.calls) == 6
+    assert fake_draft.request_counts == [3]
+
+    with get_session() as session:
+        run = _the_run(session)
+        assert run.status == RunStatus.REVIEW
+        drafts = repo.list_drafts_for_run(session, run.id)
+    assert len(drafts) == 3
 
 
 # ---------------------------------------------------------------------------
@@ -349,12 +502,13 @@ def test_stop_after_matching_runs_the_loop(e2e_setup, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# (e) Top-up DiscoveryError breaks the loop, then the gate fails loudly
+# (e) Top-up DiscoveryError breaks the loop, then partial delivery drafts what
+#     matched
 # ---------------------------------------------------------------------------
 
 
-def test_topup_discovery_error_breaks_then_gate_fails(e2e_setup, monkeypatch):
-    """A DiscoveryError on a TOP-UP pass breaks the loop; gate then fails loudly."""
+def test_topup_discovery_error_breaks_then_partial_delivery(e2e_setup, monkeypatch):
+    """A DiscoveryError on a TOP-UP pass breaks the loop; the run delivers partial."""
     inputs = e2e_setup["inputs"]
     _mock_ingestion(monkeypatch, count=3)
 
@@ -378,14 +532,16 @@ def test_topup_discovery_error_breaks_then_gate_fails(e2e_setup, monkeypatch):
     runner = CliRunner()
     result = runner.invoke(app, ["run", "--inputs", str(inputs)])
 
-    # Mid-loop error is swallowed (warning, not re-raised); the exact-N gate then
-    # fails loudly because have (1) < count (3). Nothing is drafted.
-    assert result.exit_code == 1, result.output
+    # Mid-loop error is swallowed (warning, not re-raised); the run then falls
+    # through to partial delivery, drafting the 1 matched professor.
+    assert result.exit_code == 0, result.output
     assert "Top-up discovery stopped early" in result.output  # the swallowed error
-    assert fake_draft.request_counts == []  # nothing drafted
+    assert "Found 1 of 3" in result.output  # the shortfall warning
+    assert fake_draft.request_counts == [1]  # the one matched professor
 
     with get_session() as session:
         run = _the_run(session)
-        assert run.status == RunStatus.FAILED
-        assert run.error and "count unreachable" in run.error
-        assert "found 1 of 3" in run.error
+        # NOT FAILED — partial delivery ends in the normal REVIEW state.
+        assert run.status == RunStatus.REVIEW
+        drafts = repo.list_drafts_for_run(session, run.id)
+    assert len(drafts) == 1

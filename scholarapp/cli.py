@@ -29,7 +29,6 @@ from scholarapp.db import repo
 from scholarapp.db.models import DraftStatus, Project, RunStatus
 from scholarapp.db.session import get_session
 from scholarapp.errors import (
-    CountUnreachableError,
     DiscoveryError,
     IngestionError,
     MatchingError,
@@ -61,6 +60,12 @@ class PipelineStage(str, enum.Enum):
 # this constant only bounds pathological cases where progress stalls in a way
 # the zero-new-qualifiers termination doesn't already catch.
 MAX_DISCOVERY_PASSES = 10
+
+# Termination for the top-up loop when passes keep surfacing professors but none
+# of them add a NEW matched professor. Stop after this many CONSECUTIVE empty
+# batches (genuine field exhaustion — a pass that returns zero candidates — is a
+# separate, immediate break and is NOT counted toward this streak).
+MAX_EMPTY_TOPUP_BATCHES = 5
 
 
 logging.basicConfig(
@@ -398,10 +403,6 @@ def run(
         field = prompt_data.field
         interests = resume_data.interests
         experiences_text = _summarize_experiences(resume_data.experiences)
-        # Will-draft mode: the exact-N gate (fail loudly before drafting) applies
-        # only when the run produces drafts. Under --stop-after discovery/matching
-        # no Sonnet is spent, so a shortfall is a warning, not a hard failure.
-        producing_drafts = stop_after is None
 
         # --- Discover ----------------------------------------------------------
         ui.section("Discover")
@@ -469,31 +470,17 @@ def run(
         # --- Top-up loop -------------------------------------------------------
         # Checkpoint AFTER matching, BEFORE drafting. Keep discovering+matching
         # NEW professors until we have `count` with a match, the field is
-        # exhausted (a pass yields zero new qualifying professors), or the
-        # runaway guard trips. Mid-loop DiscoveryError/MatchingError break the
-        # loop quietly — the exact-N gate below decides the run's fate.
+        # exhausted (a pass yields zero new candidates), MAX_EMPTY_TOPUP_BATCHES
+        # consecutive passes add no new matched professor, or the runaway guard
+        # trips. None of these is fatal: on shortfall we deliver partially below.
+        # Mid-loop DiscoveryError/MatchingError break the loop quietly.
         passes = 1  # the initial pass above counts as pass 1
+        empty_batches = 0  # consecutive top-up passes that added no new match
         while have < count:
             if passes >= MAX_DISCOVERY_PASSES:
                 # Runaway guard. Should be unreachable in practice (the zero-new
-                # termination fires first), so treat as field-unreachable.
-                if producing_drafts:
-                    with get_session() as session:
-                        repo.update_run_status(
-                            session,
-                            run_id,
-                            RunStatus.FAILED,
-                            error=(
-                                f"count unreachable: hit MAX_DISCOVERY_PASSES "
-                                f"({MAX_DISCOVERY_PASSES}) with {have} of {count}"
-                            ),
-                        )
-                    raise CountUnreachableError(
-                        f"Found {have} of {count} professors after "
-                        f"{MAX_DISCOVERY_PASSES} discovery passes. The field "
-                        f"{field!r} appears too narrow to supply more qualifying "
-                        "professors with matchable projects."
-                    )
+                # and empty-streak terminations fire first). Stop and fall
+                # through to partial delivery — never fatal.
                 ui.warn(
                     f"Stopped top-up after {MAX_DISCOVERY_PASSES} passes with "
                     f"{have} of {count} professors."
@@ -547,16 +534,24 @@ def run(
                 break
 
             new_have = _count_professors_with_matches(run_id)
-            if new_have <= have:
-                # This pass added professors but none qualified (no matchable
-                # projects). No progress → stop to avoid spinning.
-                ui.info(
-                    "[dim]Top-up pass produced no newly matched professors — "
-                    "stopping.[/dim]"
-                )
+            if new_have > have:
+                # Progress: this pass added at least one newly matched professor.
+                # Reset the empty-batch streak.
                 have = new_have
-                break
+                empty_batches = 0
+                continue
+
+            # This pass added professors but none qualified (no matchable
+            # projects). Count it toward the consecutive-empty streak; only stop
+            # once the streak reaches MAX_EMPTY_TOPUP_BATCHES.
             have = new_have
+            empty_batches += 1
+            if empty_batches >= MAX_EMPTY_TOPUP_BATCHES:
+                ui.info(
+                    f"[dim]Top-up produced no newly matched professors in "
+                    f"{MAX_EMPTY_TOPUP_BATCHES} consecutive passes — stopping.[/dim]"
+                )
+                break
 
         # --- Exact-N gate ------------------------------------------------------
         if stop_after == PipelineStage.matching:
@@ -574,33 +569,25 @@ def run(
             ui.info("[dim]Stopped after matching as requested (--stop-after matching).[/dim]")
             return
 
-        # Will draft. Fail loudly BEFORE spending any Sonnet on a doomed run.
+        # Partial delivery: a shortfall is NOT fatal. Warn, then draft whatever
+        # matched professors we have. A short run is a successful partial
+        # delivery and ends in RunStatus.REVIEW like any other run.
         if have < count:
-            with get_session() as session:
-                repo.update_run_status(
-                    session,
-                    run_id,
-                    RunStatus.FAILED,
-                    error=(
-                        f"count unreachable: found {have} of {count} professors "
-                        "with a matched project"
-                    ),
-                )
-            raise CountUnreachableError(
+            ui.warn(
                 f"Found {have} of {count} professors with a matched project. "
-                "Cannot draft the requested number of emails. Likely cause: the "
-                f"field {field!r} is too narrow, the Tavily quota is exhausted, "
-                "or too few of the discovered projects matched your interests. "
-                "The discovered professors and matches are saved; try a broader "
-                "field, a lower count, or rerun later."
+                f"Drafting the {have} we have. Likely cause: the field {field!r} "
+                "is too narrow, the Tavily quota is exhausted, or too few of the "
+                "discovered projects matched your interests. Try a broader field, "
+                "a lower count, or rerun later."
+            )
+        else:
+            ui.info(
+                f"[green]✓[/green] Reached target: {have} of {count} professors "
+                "with a matched project."
             )
 
         with get_session() as session:
             repo.update_run_status(session, run_id, RunStatus.DRAFTING)
-        ui.info(
-            f"[green]✓[/green] Reached target: {have} of {count} professors "
-            "with a matched project."
-        )
 
         # --- Draft -------------------------------------------------------------
         ui.section("Draft")

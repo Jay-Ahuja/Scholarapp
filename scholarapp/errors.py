@@ -45,7 +45,3 @@ class DeliveryError(ScholarError):
 
 class SendingDisabled(DeliveryError):
     """Sending is gated behind SEND_ENABLED=false. Raised by `scholar send` (Step 8)."""
-
-
-class CountUnreachableError(ScholarError):
-    """The field cannot supply the requested number of qualifying professors."""
