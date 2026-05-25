@@ -11,8 +11,30 @@ async def find_professors(
     user_interests: list[str],
     *,
     exclude_ids: set[str] | None = None,
-) -> list[ProfessorCandidate]
+) -> DiscoveryResult
 ```
+
+`find_professors` returns a `DiscoveryResult` — a frozen `@dataclass` (defined in
+[scholarapp/modules/discovery.py](../scholarapp/modules/discovery.py), alongside
+`ProfessorCandidate`; it's a plain dataclass, not Pydantic) that bundles two things:
+
+```python
+@dataclass(frozen=True)
+class DiscoveryResult:
+    professors: list[ProfessorCandidate]  # email-validated survivors, capped at `count`
+    attempted_ids: set[str]               # short OpenAlex IDs of EVERY author enriched this pass
+```
+
+- **`professors`** — the email-validated survivors, capped at `count`. This is the same
+  list the function used to return directly; nothing about it changed.
+- **`attempted_ids`** — the short-form OpenAlex author IDs (same form as
+  `ProfessorCandidate.openalex_id`) of **every** author the pass ran through enrichment:
+  the full pulled → exclude-filtered → deduped pool that each incurred a paid Tavily
+  search + Haiku extraction. It includes both the survivors **and** the authors dropped
+  for lacking an academic email. The CLI top-up loop excludes this whole set — not just
+  the survivors — so later passes never re-pull and re-pay for the same top-cited authors
+  a prior pass already enriched and discarded. See
+  [The `exclude_ids` contract](#the-exclude_ids-contract-how-passes-make-progress) below.
 
 `user_interests` is accepted but not yet used — actual relevance ranking happens in
 Step 5 (matching). Today it's a forward-compatible knob for future "narrow the author
@@ -77,15 +99,23 @@ field (str) ──┐
                                              email + faculty_page_url
                           (or None — candidate gets dropped downstream)
               ▼
+    Record the short IDs of the WHOLE enriched pool as `attempted_ids`
+    (captured before the gather — survivors AND email-less discards).
+              ▼
     Drop candidates where email fails the academic-TLD allowlist.
-    Take the first `count` survivors and return them.
+    Take the first `count` survivors → DiscoveryResult(professors, attempted_ids).
 ```
 
-`find_professors` is one *pass*. It returns up to `count` survivors; it never tries to
-guarantee exactly `count`. The exact-count guarantee lives one level up, in the CLI's
-top-up loop, which calls `find_professors` repeatedly with a growing `exclude_ids`
-until the requested number of *draftable* professors is reached or the field is
-exhausted. See the next section.
+`find_professors` is one *pass*. Its `professors` list holds up to `count` survivors; it
+never tries to guarantee exactly `count`. The exact-count guarantee lives one level up,
+in the CLI's top-up loop, which calls `find_professors` repeatedly with a growing
+`exclude_ids` until the requested number of *draftable* professors is reached or the
+field is exhausted. See the next section.
+
+Note the asymmetry between the two `DiscoveryResult` fields: `professors` is *capped* at
+`count` (the survivor loop breaks once it has `count`), but `attempted_ids` reflects the
+**entire** enriched pool — it's captured before the enrichment fan-out, so it counts
+every author that was paid for even though only `count` survivors are returned.
 
 ## The count guarantee and the discovery top-up loop
 
@@ -145,7 +175,10 @@ Each pass is two persisted steps, factored into helpers so the initial pass and 
 top-up share code:
 
 - `_discover_and_persist(...)` → calls `find_professors(..., exclude_ids=...)`, writes
-  the new `Professor` + `Project` rows, and returns `(candidates, new_professor_ids)`.
+  the new `Professor` + `Project` rows, and returns
+  `(candidates, new_professor_ids, attempted_ids)`. The third element forwards the
+  `DiscoveryResult.attempted_ids` straight through so the caller can grow `exclude_ids`
+  by **every** author the pass paid to enrich — not just the survivors in `candidates`.
 - `_match_and_persist(professor_ids=...)` → matches **only** the newly persisted
   professors (so a top-up never re-matches and re-pays for professors matched in an
   earlier pass), persisting their matched projects.
@@ -156,10 +189,25 @@ OpenAlex `/authors` sorts by citation count, so a naive re-fetch would return th
 top-cited authors every pass and the loop would never advance. `exclude_ids` solves
 this:
 
-- It carries the short-form OpenAlex author IDs seen so far this run
+- It carries the short-form OpenAlex author IDs **attempted** so far this run
   (`seen_openalex_ids` in `run()`, grown after every pass).
+- The set grows by each pass's `attempted_ids` — the **whole enriched pool**, survivors
+  **and** the authors dropped for lacking an email — **not** by the survivors alone. This
+  is the key correctness property: every author a pass pays to enrich is a top-cited
+  author OpenAlex would otherwise hand back first on the next pass. Excluding only the
+  survivors used to let the email-less discards get re-pulled and re-paid for pass after
+  pass, so the loop spun on the same dropped top-cited people instead of advancing to
+  deeper ranks. Excluding the full attempted pool forces each pass onto fresh authors.
+- The growth happens after **both** the initial pass and **every** top-up pass, via
+  `seen_openalex_ids.update(attempted_ids)` (initial) and
+  `seen_openalex_ids.update(topup_attempted_ids)` (each top-up). Crucially, the top-up
+  update runs **before** the field-exhaustion check — so a pass that paid to enrich
+  authors but produced **no** email-validated survivor still records its pool, and the
+  next pass won't re-pull it. (A pass that surfaces no *new* authors at all returns an
+  empty `attempted_ids`, which is also the field-exhaustion signal.)
 - `find_professors` drops excluded authors via `_filter_excluded` **BEFORE enrichment**,
-  so an already-seen author costs **no** Tavily search and **no** Haiku call.
+  so an already-seen author costs **no** Tavily search and **no** Haiku call — and, being
+  filtered out before enrichment, an excluded author never re-enters `attempted_ids`.
 - The OpenAlex fetch is sized up to make room for the ones it's about to drop:
   `target_pool = (count + len(exclude_ids)) * OVERFETCH_MULTIPLIER`. Without the
   `+ len(exclude_ids)` term, the excluded top-cited authors would eat into the pool and
@@ -178,9 +226,13 @@ stop short of `count` falls through to partial delivery (next section):
 1. **Target reached** — `have >= count`. The loop condition (`while have < count`) is
    false. The run proceeds to draft exactly `count`.
 2. **Field exhausted** — a top-up pass returns **zero new candidates**
-   (`find_professors` found no new qualifying authors). With nothing left to discover
-   there's no progress to be had, so the loop breaks immediately. This is the *genuine
-   exhaustion* case and is **not** counted toward the empty-batch streak below.
+   (`find_professors.professors` is empty — no new author survived email validation).
+   With nothing left to deliver there's no progress to be had, so the loop breaks. This
+   is the *genuine exhaustion* case and is **not** counted toward the empty-batch streak
+   below. Note the loop folds that pass's `attempted_ids` into `seen_openalex_ids`
+   **before** this check, so even a survivor-less pass that *did* pay to enrich some
+   authors records its pool first — but if the pass surfaced no authors at all (true
+   exhaustion) `attempted_ids` is empty and the update is a no-op.
 3. **Empty-batch streak** — a pass that *did* surface new, previously-unseen professors
    but added **zero newly-matched** professors (`new_have <= have` — they all had no
    matchable project) is an "empty batch". A single empty batch no longer stops the
