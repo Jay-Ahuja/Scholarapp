@@ -193,15 +193,18 @@ def _discover_and_persist(
     count: int,
     interests: list[str],
     exclude_ids: set[str],
-) -> tuple[list[discovery.ProfessorCandidate], list[str]]:
+) -> tuple[list[discovery.ProfessorCandidate], list[str], set[str]]:
     """Discover `count` NEW professors (excluding `exclude_ids`) and persist them.
 
-    Returns `(candidates, new_professor_ids)` so the caller can report, grow
-    `exclude_ids` from the candidates' OpenAlex IDs, and match ONLY the newly
-    persisted professors. Professors + their projects are written here; matching
+    Returns `(candidates, new_professor_ids, attempted_ids)` so the caller can
+    report, grow `exclude_ids` by EVERY author this pass paid to enrich
+    (`attempted_ids`, not just the survivors), and match ONLY the newly persisted
+    professors. Excluding all attempted authors — including those dropped for
+    lacking an email — keeps later passes from re-pulling and re-paying for the
+    same top-cited people. Professors + their projects are written here; matching
     happens separately.
     """
-    candidates = asyncio.run(
+    result = asyncio.run(
         discovery.find_professors(
             field=field,
             count=count,
@@ -209,6 +212,7 @@ def _discover_and_persist(
             exclude_ids=exclude_ids,
         )
     )
+    candidates = result.professors
     new_professor_ids: list[str] = []
     with get_session() as session:
         for c in candidates:
@@ -232,7 +236,7 @@ def _discover_and_persist(
                     abstract=w.abstract,
                     raw_json={"openalex_id": w.openalex_id},
                 )
-    return candidates, new_professor_ids
+    return candidates, new_professor_ids, result.attempted_ids
 
 
 def _match_and_persist(
@@ -420,7 +424,7 @@ def run(
                 f"Discovering up to {count} professors in "
                 f"[italic]{field}[/italic]..."
             ):
-                candidates, new_prof_ids = _discover_and_persist(
+                candidates, new_prof_ids, attempted_ids = _discover_and_persist(
                     run_id=run_id,
                     field=field,
                     count=count,
@@ -434,7 +438,10 @@ def run(
                 )
             raise
 
-        seen_openalex_ids.update(c.openalex_id for c in candidates)
+        # Exclude EVERY author this pass paid to enrich — survivors AND the
+        # email-less discards — so the first top-up advances to deeper ranks
+        # instead of re-pulling and re-paying for this pass's discards.
+        seen_openalex_ids.update(attempted_ids)
         ui.professors_table(candidates)
 
         with get_session() as session:
@@ -499,12 +506,14 @@ def run(
                     f"Discovering {shortfall} more professors in "
                     f"[italic]{field}[/italic]..."
                 ):
-                    topup_candidates, topup_prof_ids = _discover_and_persist(
-                        run_id=run_id,
-                        field=field,
-                        count=shortfall,
-                        interests=interests,
-                        exclude_ids=seen_openalex_ids,
+                    topup_candidates, topup_prof_ids, topup_attempted_ids = (
+                        _discover_and_persist(
+                            run_id=run_id,
+                            field=field,
+                            count=shortfall,
+                            interests=interests,
+                            exclude_ids=seen_openalex_ids,
+                        )
                     )
             except (DiscoveryError, MatchingError) as e:
                 # Mid-loop error: break (do NOT mark FAILED / re-raise here). The
@@ -512,12 +521,16 @@ def run(
                 ui.warn(f"Top-up discovery stopped early: {e}")
                 break
 
+            # Grow exclude by EVERY author this pass paid to enrich (survivors +
+            # discards) BEFORE the field-exhaustion check — even a pass that
+            # surfaces no email-validated survivor still paid for its pool, and
+            # the next pass must not re-pull it.
+            seen_openalex_ids.update(topup_attempted_ids)
+
             if not topup_candidates:
                 # Field exhausted — no NEW qualifying authors surfaced this pass.
                 ui.info("[dim]No new professors available — field exhausted.[/dim]")
                 break
-
-            seen_openalex_ids.update(c.openalex_id for c in topup_candidates)
             ui.professors_table(topup_candidates)
 
             try:

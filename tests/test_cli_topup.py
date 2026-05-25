@@ -62,7 +62,9 @@ class _FakeDiscovery:
 
     `pool` is the ordered list of available slugs (most-cited first). Each call
     returns up to `count` slugs not in `exclude_ids`, simulating OpenAlex's
-    exclude-aware over-fetch. Records every call for assertions.
+    exclude-aware over-fetch. Every returned professor has an email, so the
+    DiscoveryResult's `attempted_ids` equals the returned (survivor) slugs.
+    Records every call for assertions.
     """
 
     def __init__(self, pool: list[str]):
@@ -76,7 +78,7 @@ class _FakeDiscovery:
         count: int,
         user_interests: list[str],
         exclude_ids: set[str] | None = None,
-    ) -> list[discovery.ProfessorCandidate]:
+    ) -> discovery.DiscoveryResult:
         exclude = exclude_ids or set()
         self.calls.append(
             {"field": field, "count": count, "exclude_ids": set(exclude)}
@@ -88,7 +90,9 @@ class _FakeDiscovery:
             if slug in exclude:
                 continue
             out.append(_candidate(slug))
-        return out
+        return discovery.DiscoveryResult(
+            professors=out, attempted_ids={c.openalex_id for c in out}
+        )
 
 
 class _FakeMatching:
@@ -264,6 +268,90 @@ def test_topup_reaches_count_and_drafts_exactly_n(e2e_setup, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# (a.2) Enriched-but-dropped (no-email) authors are excluded on the NEXT pass —
+#       no author incurs a paid lookup twice across passes.
+# ---------------------------------------------------------------------------
+
+
+class _PoolDiscovery:
+    """Simulates the real pull→enrich→drop pipeline at the pass level.
+
+    Each call pulls the first `count` NON-excluded slugs from `pool` as its
+    enriched pool, returns only the ones in `with_email` as survivors, and
+    reports the WHOLE enriched pool (survivors + email-less discards) as
+    `attempted_ids`. This is the scenario the bug fix targets: discards must be
+    excluded so a later pass never re-pulls (re-pays for) them.
+    """
+
+    def __init__(self, pool: list[str], with_email: set[str]):
+        self.pool = pool
+        self.with_email = with_email
+        self.calls: list[dict[str, Any]] = []
+        self.enriched_per_call: list[list[str]] = []
+
+    async def __call__(
+        self,
+        *,
+        field: str,
+        count: int,
+        user_interests: list[str],
+        exclude_ids: set[str] | None = None,
+    ) -> discovery.DiscoveryResult:
+        exclude = set(exclude_ids or set())
+        self.calls.append({"field": field, "count": count, "exclude_ids": exclude})
+        enriched = [s for s in self.pool if s not in exclude][:count]
+        self.enriched_per_call.append(enriched)
+        survivors = [_candidate(s) for s in enriched if s in self.with_email]
+        return discovery.DiscoveryResult(
+            professors=survivors, attempted_ids=set(enriched)
+        )
+
+
+def test_topup_excludes_enriched_but_dropped_authors(e2e_setup, monkeypatch):
+    """A pass's email-less discards are excluded next pass — no double paid lookup."""
+    inputs = e2e_setup["inputs"]
+    _mock_ingestion(monkeypatch, count=2)
+
+    # Pool of 4. count=2 → pass 1 enriches a,b but only `a` has an email; `b` is a
+    # paid-but-dropped discard. Pass 2 must advance to c,d (NOT re-pull a or b).
+    fake_disc = _PoolDiscovery(pool=["a", "b", "c", "d"], with_email={"a", "c", "d"})
+    fake_match = _FakeMatching(qualifying={"a", "c", "d"})
+    fake_draft = _FakeDrafting()
+    monkeypatch.setattr(discovery, "find_professors", fake_disc)
+    monkeypatch.setattr(matching, "match_projects_for_run", fake_match)
+    monkeypatch.setattr(drafting, "draft_emails_for_run", fake_draft)
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["run", "--inputs", str(inputs)])
+
+    assert result.exit_code == 0, result.output
+
+    # Pass 1 excludes nothing; pass 2 excludes BOTH the survivor `a` AND the
+    # email-less discard `b` — the whole enriched pool of pass 1.
+    assert len(fake_disc.calls) == 2
+    assert fake_disc.calls[0]["exclude_ids"] == set()
+    assert fake_disc.calls[1]["exclude_ids"] == {"a", "b"}
+
+    # No author is enriched twice across passes (the core regression guard).
+    all_enriched = [s for call in fake_disc.enriched_per_call for s in call]
+    assert len(all_enriched) == len(set(all_enriched)), (
+        f"an author was enriched twice: {all_enriched}"
+    )
+    # Pass 2 advances PAST the pass-1 discard `b` straight to fresh ranks — `b` is
+    # never re-enriched (which was the bug: discards used to get re-pulled).
+    assert "b" not in fake_disc.enriched_per_call[1]
+    assert "a" not in fake_disc.enriched_per_call[1]
+    assert fake_disc.enriched_per_call[1] == ["c"]
+
+    assert fake_draft.request_counts == [2]
+    with get_session() as session:
+        run = _the_run(session)
+        assert run.status == RunStatus.REVIEW
+        drafts = repo.list_drafts_for_run(session, run.id)
+    assert len(drafts) == 2
+
+
+# ---------------------------------------------------------------------------
 # (b) Field exhausted → PARTIAL delivery: drafts what matched, exits 0, REVIEW
 # ---------------------------------------------------------------------------
 
@@ -326,13 +414,16 @@ class _BatchDiscovery:
         count: int,
         user_interests: list[str],
         exclude_ids: set[str] | None = None,
-    ) -> list[discovery.ProfessorCandidate]:
+    ) -> discovery.DiscoveryResult:
         idx = len(self.calls)
         self.calls.append(
             {"field": field, "count": count, "exclude_ids": set(exclude_ids or set())}
         )
         slugs = self.batches[idx] if idx < len(self.batches) else []
-        return [_candidate(s) for s in slugs]
+        cands = [_candidate(s) for s in slugs]
+        return discovery.DiscoveryResult(
+            professors=cands, attempted_ids={c.openalex_id for c in cands}
+        )
 
 
 def test_topup_one_empty_then_matching_reaches_count(e2e_setup, monkeypatch):
