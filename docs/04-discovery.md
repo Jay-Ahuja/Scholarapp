@@ -9,12 +9,43 @@ async def find_professors(
     field: str,
     count: int,
     user_interests: list[str],
-) -> list[ProfessorCandidate]
+    *,
+    exclude_ids: set[str] | None = None,
+) -> DiscoveryResult
 ```
+
+`find_professors` returns a `DiscoveryResult` — a frozen `@dataclass` (defined in
+[scholarapp/modules/discovery.py](../scholarapp/modules/discovery.py), alongside
+`ProfessorCandidate`; it's a plain dataclass, not Pydantic) that bundles two things:
+
+```python
+@dataclass(frozen=True)
+class DiscoveryResult:
+    professors: list[ProfessorCandidate]  # email-validated survivors, capped at `count`
+    attempted_ids: set[str]               # short OpenAlex IDs of EVERY author enriched this pass
+```
+
+- **`professors`** — the email-validated survivors, capped at `count`. This is the same
+  list the function used to return directly; nothing about it changed.
+- **`attempted_ids`** — the short-form OpenAlex author IDs (same form as
+  `ProfessorCandidate.openalex_id`) of **every** author the pass ran through enrichment:
+  the full pulled → exclude-filtered → deduped pool that each incurred a paid Tavily
+  search + Haiku extraction. It includes both the survivors **and** the authors dropped
+  for lacking an academic email. The CLI top-up loop excludes this whole set — not just
+  the survivors — so later passes never re-pull and re-pay for the same top-cited authors
+  a prior pass already enriched and discarded. See
+  [The `exclude_ids` contract](#the-exclude_ids-contract-how-passes-make-progress) below.
 
 `user_interests` is accepted but not yet used — actual relevance ranking happens in
 Step 5 (matching). Today it's a forward-compatible knob for future "narrow the author
 pool by interest" logic.
+
+`exclude_ids` is the keyword-only hook the CLI's count-guarantee top-up loop uses to
+ask for *new* candidates on repeat passes. It holds short-form OpenAlex author IDs
+(the same form as `ProfessorCandidate.openalex_id`) already discovered earlier in the
+run. `exclude_ids=None` (the default) preserves the original single-pass behavior. See
+[The count guarantee and the discovery top-up loop](#the-count-guarantee-and-the-discovery-top-up-loop)
+below for the full contract.
 
 ## Data-flow diagram
 
@@ -37,7 +68,13 @@ field (str) ──┐
     │  &sort=cited_by     │         last_known_institutions.type:education,
     │                     │         works_count:>10
     └─────────┬───────────┘
-              │  ~3×count authors (over-fetch)
+              │  (count + len(exclude_ids)) × 3 authors (over-fetch)
+              ▼
+    ┌─────────────────────┐
+    │ Filter excluded     │  _filter_excluded — drop already-seen
+    │ (exclude_ids)       │  OpenAlex IDs BEFORE any paid lookup
+    └─────────┬───────────┘
+              │  only NEW candidates remain
               ▼
     ┌─────────────────────┐
     │ Dedup within run    │  _dedup_authors — collapse duplicate
@@ -62,9 +99,215 @@ field (str) ──┐
                                              email + faculty_page_url
                           (or None — candidate gets dropped downstream)
               ▼
+    Record the short IDs of the WHOLE enriched pool as `attempted_ids`
+    (captured before the gather — survivors AND email-less discards).
+              ▼
     Drop candidates where email fails the academic-TLD allowlist.
-    Take the first `count` survivors. Done.
+    Take the first `count` survivors → DiscoveryResult(professors, attempted_ids).
 ```
+
+`find_professors` is one *pass*. Its `professors` list holds up to `count` survivors; it
+never tries to guarantee exactly `count`. The exact-count guarantee lives one level up,
+in the CLI's top-up loop, which calls `find_professors` repeatedly with a growing
+`exclude_ids` until the requested number of *draftable* professors is reached or the
+field is exhausted. See the next section.
+
+Note the asymmetry between the two `DiscoveryResult` fields: `professors` is *capped* at
+`count` (the survivor loop breaks once it has `count`), but `attempted_ids` reflects the
+**entire** enriched pool — it's captured before the enrichment fan-out, so it counts
+every author that was paid for even though only `count` survivors are returned.
+
+## The count guarantee and the discovery top-up loop
+
+A `scholar run` tries to produce **exactly** the requested `count` of personalized
+drafts. When the field can supply that many matchable professors it does; when it
+**falls short**, the run **delivers what it matched** — a successful *partial delivery*
+that ends in the normal review state with a clear shortfall warning, never a hard
+failure. This is a property of the *pipeline*, not of `find_professors` alone.
+`find_professors` is best-effort and returns "up to `count`"; the top-up orchestration
+in [scholarapp/cli.py](../scholarapp/cli.py) `run()` drives toward the target and
+decides what to draft when the field runs dry.
+
+### Why a loop is needed: two drop points
+
+The requested count leaks at two independent points downstream of the OpenAlex author
+list:
+
+1. **Email-validation dropout (discovery).** ~20–30% of candidates lose their email in
+   the Tavily + LLM enrichment step and get dropped (see
+   [Over-fetch then filter](#over-fetch-then-filter)). Over-fetching covers the
+   *typical* loss but cannot guarantee it.
+2. **The no-project-match skip (drafting).** A professor with **zero matched projects**
+   is never drafted (Step 5 returned no relevant work). Drafting skips them on purpose
+   — we never draft a professor with no matched project — which removes them from the
+   delivered count.
+
+A single discovery pass therefore routinely lands below `count`. The top-up loop
+replaces the dropped professors by discovering and matching *more*, then re-checking.
+
+### Where the loop lives in the pipeline
+
+```
+parse → discover (pass 1) → match (pass 1) ──┐
+                                             ▼
+                          ┌──────────────────────────────────┐
+                          │  have = professors with ≥1 match  │
+                          └──────────────┬───────────────────┘
+                                         │ have < count?
+                  ┌──────────────────────┴───────────────────────┐
+                  │ yes                                        no  │
+                  ▼                                                ▼
+   discover shortfall (exclude seen IDs)              ── partial-delivery gate ──
+   → match new professors → recompute have            have < count → warn, draft the
+   → loop (until target / exhaustion /                              `have` we matched
+     5 empty batches / pass cap)                      have ≥ count → draft exactly count
+                                                       (either way → end in REVIEW)
+```
+
+The loop **checkpoints AFTER matching and BEFORE drafting**: the `have` it compares
+against `count` is the number of professors with ≥1 matched project — exactly the set
+drafting keeps. This is computed by `_count_professors_with_matches(run_id)`. Checking
+*after* matching is what lets the loop see the no-project-match skip and top up for it,
+and it means the loop spends **no** Sonnet (drafting) tokens chasing the count — drafting
+only starts once the loop has settled on the professors it will deliver.
+
+Each pass is two persisted steps, factored into helpers so the initial pass and every
+top-up share code:
+
+- `_discover_and_persist(...)` → calls `find_professors(..., exclude_ids=...)`, writes
+  the new `Professor` + `Project` rows, and returns
+  `(candidates, new_professor_ids, attempted_ids)`. The third element forwards the
+  `DiscoveryResult.attempted_ids` straight through so the caller can grow `exclude_ids`
+  by **every** author the pass paid to enrich — not just the survivors in `candidates`.
+- `_match_and_persist(professor_ids=...)` → matches **only** the newly persisted
+  professors (so a top-up never re-matches and re-pays for professors matched in an
+  earlier pass), persisting their matched projects. When a top-up pass persists **no**
+  new professor (every pulled author dropped at email validation), the loop **skips this
+  step entirely** — guarded by `if topup_prof_ids:` — since there is nothing to match;
+  the pass still counts toward the empty-batch streak.
+
+### The `exclude_ids` contract (how passes make progress)
+
+OpenAlex `/authors` sorts by citation count, so a naive re-fetch would return the same
+top-cited authors every pass and the loop would never advance. `exclude_ids` solves
+this:
+
+- It carries the short-form OpenAlex author IDs **attempted** so far this run
+  (`seen_openalex_ids` in `run()`, grown after every pass).
+- The set grows by each pass's `attempted_ids` — the **whole enriched pool**, survivors
+  **and** the authors dropped for lacking an email — **not** by the survivors alone. This
+  is the key correctness property: every author a pass pays to enrich is a top-cited
+  author OpenAlex would otherwise hand back first on the next pass. Excluding only the
+  survivors used to let the email-less discards get re-pulled and re-paid for pass after
+  pass, so the loop spun on the same dropped top-cited people instead of advancing to
+  deeper ranks. Excluding the full attempted pool forces each pass onto fresh authors.
+- The growth happens after **both** the initial pass and **every** top-up pass, via
+  `seen_openalex_ids.update(attempted_ids)` (initial) and
+  `seen_openalex_ids.update(topup_attempted_ids)` (each top-up). Crucially, the top-up
+  update runs **before** the field-exhaustion check — so a pass that paid to enrich
+  authors but produced **no** email-validated survivor still records its pool, and the
+  next pass won't re-pull it. That survivor-less pass is **not** exhaustion: it had a
+  non-empty `attempted_ids`, so it keeps the loop going (counted toward the empty-batch
+  streak). The field-exhaustion signal is the opposite — a pass that surfaces no *new*
+  authors at all, so its `attempted_ids` is **empty** (and the update above is a no-op).
+- `find_professors` drops excluded authors via `_filter_excluded` **BEFORE enrichment**,
+  so an already-seen author costs **no** Tavily search and **no** Haiku call — and, being
+  filtered out before enrichment, an excluded author never re-enters `attempted_ids`.
+- The OpenAlex fetch is sized up to make room for the ones it's about to drop:
+  `target_pool = (count + len(exclude_ids)) * OVERFETCH_MULTIPLIER`. Without the
+  `+ len(exclude_ids)` term, the excluded top-cited authors would eat into the pool and
+  a repeat pass could surface fewer than `count` *new* candidates. `OVERFETCH_MULTIPLIER`
+  stays **3**.
+
+`exclude_ids=None` reproduces the pre-feature single-pass behavior exactly (empty set,
+no filtering, `target_pool = count * 3`), so callers that don't need top-up are
+unaffected.
+
+### Termination conditions
+
+The loop in `run()` stops as soon as any of these holds. **None of them is fatal** — a
+stop short of `count` falls through to partial delivery (next section):
+
+1. **Target reached** — `have >= count`. The loop condition (`while have < count`) is
+   false. The run proceeds to draft exactly `count`.
+2. **Field exhausted** — a top-up pass surfaces **no new authors at all**: its
+   `attempted_ids` is **empty** (nothing pulled, nothing paid for). Only this signals
+   genuine exhaustion — OpenAlex, after the exclude filter, had no fresh author left to
+   hand back — so the loop breaks (`if not topup_attempted_ids: break`). This is the
+   *genuine exhaustion* case and is **not** counted toward the empty-batch streak below.
+   Note the loop folds that pass's `attempted_ids` into `seen_openalex_ids` **before**
+   this check; when `attempted_ids` is empty the update is a harmless no-op.
+
+   A pass that **did** pull new authors but produced **no email-validated survivor**
+   (every author dropped at email validation) is **not** exhaustion: it spent money
+   exploring deeper ranks, so its `attempted_ids` is non-empty and the loop keeps going,
+   counting the pass toward the empty-batch streak below. The stop signal is "discovery
+   found nobody new," never "this pass had no survivors."
+3. **Empty-batch streak** — a **non-productive pass** is one that pulled new authors
+   (non-empty `attempted_ids`) but added **zero newly-matched** professors
+   (`new_have <= have`). Two distinct causes are folded into this one bucket and treated
+   **uniformly** — each counts as exactly one non-productive pass:
+   - **(a) zero survivors** — every pulled author was dropped at email validation, so no
+     new professor was persisted. When this happens the match step is **skipped**
+     entirely (the `if topup_prof_ids:` guard — there is nothing to match), and the pass
+     still counts toward the streak.
+   - **(b) survivors matched no project** — new professors were persisted and matched,
+     but none gained a matchable project, so `have` didn't grow.
+
+   A single non-productive pass no longer stops the search: the loop tolerates up to
+   `MAX_EMPTY_TOPUP_BATCHES = 5` **consecutive** such passes before giving up. The streak
+   (`empty_batches`) **resets to 0** the moment any pass adds at least one new match
+   (`new_have > have`), so the loop keeps reaching for matchable professors that are still
+   out there instead of quitting on the first dry pass. It breaks only when the streak
+   hits 5 in a row.
+4. **Runaway guard** — `MAX_DISCOVERY_PASSES = 10` (1 initial pass + up to 9 top-ups).
+   In practice the exhaustion / empty-streak terminations fire first; this constant only
+   bounds pathological non-progress the other checks miss. When it trips it `break`s into
+   the same partial-delivery path — it is **not** a hard failure.
+5. **Mid-loop error** — a `DiscoveryError` or `MatchingError` raised *inside* a top-up
+   pass (e.g., Tavily quota exhausted mid-run) **breaks** the loop quietly. It does not
+   mark the run FAILED or re-raise on its own; it lets the partial-delivery gate below
+   draft whatever matched so far. The initial pass keeps the old fatal-on-error behavior
+   — a discovery/matching error there marks the run FAILED and re-raises immediately.
+
+### The partial-delivery gate
+
+After the loop, before drafting:
+
+- If `have < count`, the run does a **partial delivery**: it `ui.warn`s a clear
+  shortfall message (`Found {have} of {count} professors with a matched project.
+  Drafting the {have} we have. …`), then advances to DRAFTING and drafts the professors
+  it *did* match. A shortfall is **not** fatal — the run finishes normally, ends in
+  `RunStatus.REVIEW` like any other run, and exits **zero**. There is no longer a hard
+  "count unreachable" failure here.
+- If `have >= count`, the run logs that it reached the target, advances to DRAFTING, and
+  drafts **exactly** `count`.
+- Either way, drafting **caps at `count`** and **never drafts a professor with no
+  matched project**: the draft-collection loop breaks once it has gathered `count`
+  requests (a generous top-up pass can overshoot) and skips any professor whose matched
+  set is empty.
+- The professors and matches discovered along the way **stay persisted**. A rerun (or a
+  lower `count` / broader field) can build on them, and `scholar status <run_id>` shows
+  the full state.
+
+Note that this non-fatal path applies only to the *top-up shortfall*. The **initial**
+discovery/matching pass still fails fatally on a real error (a missing topic, an API
+failure, etc.) — those mark the run FAILED and re-raise. `CountUnreachableError` has
+been **removed** from [scholarapp/errors.py](../scholarapp/errors.py); no code path
+raises it anymore.
+
+### Interaction with `--stop-after`
+
+- `--stop-after matching` runs the **full** top-up loop (so you get the real count it
+  can reach), then halts before drafting. A shortfall is reported as a **warning** and
+  the exit code is 0 (unchanged).
+- `--stop-after parse` and `--stop-after discovery` are unchanged by this feature: they
+  return before matching, so the loop and the gate never run. (`--stop-after discovery`
+  still runs only the single initial discovery pass.)
+
+A shortfall is non-fatal in **every** mode now: `--stop-after matching` warns and stops,
+and a full run warns and delivers the drafts it has. (There is no longer a
+`producing_drafts` branch — the old gate that failed loudly only when drafting is gone.)
 
 ## OpenAlex endpoints used
 
@@ -179,8 +422,14 @@ parallel. Why over-fetch?
   add a second Tavily query pattern. The constant lives at
   `discovery.OVERFETCH_MULTIPLIER`.
 
-If fewer than `count` survive, `find_professors` logs a warning and returns what
-we have rather than failing — partial results are still useful.
+If fewer than `count` survive, `find_professors` logs a warning and returns what we
+have rather than failing — a single pass is best-effort by design. This is **not** the
+end of the story: the CLI top-up loop re-invokes `find_professors` to make up the
+shortfall, and if the field genuinely can't supply enough it delivers the matches it
+*did* find (a partial delivery, see
+[The count guarantee and the discovery top-up loop](#the-count-guarantee-and-the-discovery-top-up-loop)).
+Over-fetching still matters — it keeps the common case to a single pass instead of
+forcing a second round of paid lookups.
 
 ## Within-run deduplication
 
@@ -224,11 +473,12 @@ professor discovered in an earlier run is not remembered here. If you want
 persistent de-duplication across runs, that's a separate, database-backed feature
 (query existing `professors` rows before enriching).
 
-**No backfill.** Dedup runs after the `count * 3` over-fetch, so it normally removes
+**No backfill within a pass.** Dedup runs after the over-fetch, so it normally removes
 only a handful of dupes from a deliberately oversized pool. If it ever leaves fewer
-than `count` unique professors, that's acceptable — we do **not** re-query OpenAlex
-to top the pool back up. Returning fewer is the same partial-results contract as the
-email-validation drop above.
+than `count` unique professors, that's acceptable *for this pass* — `find_professors`
+does **not** re-query OpenAlex inside a single call to top the pool back up. Returning
+fewer is the same best-effort, single-pass contract as the email-validation drop above;
+making up the shortfall is the CLI top-up loop's job, not this function's.
 
 When any duplicates are dropped, `_dedup_authors` logs at INFO:
 `Deduplicated N author(s) within run (U unique of T).`
@@ -301,14 +551,19 @@ worse than false negatives (losing a legitimate candidate).
   concurrency semaphore (`settings.anthropic_concurrency`, default **3**) also
   governs the per-author OpenAlex fan-out — well below anything they'd throttle.
 - **Tavily free tier** is around 1,000 requests/month at the time of writing. Each
-  discovery run uses `count * 3` Tavily requests (one per candidate). A 10-person
-  run = 30 requests. You can do ~30 runs/month on the free tier.
+  discovery *pass* uses up to `(count + len(exclude_ids)) * 3` Tavily requests (one per
+  *new* candidate enriched — excluded IDs are filtered out before enrichment and cost
+  nothing). A single-pass 10-person run = ~30 requests; a run that needs top-up passes
+  spends a bit more per shortfall pass. You can do roughly ~30 single-pass runs/month on
+  the free tier.
 - **Anthropic** is governed by your account's RPM/TPM. Each run does 1
-  `_llm_pick_topics` call + `count * 3` `_llm_extract_email` calls (one per
-  candidate). For a 10-person run that's ~31 calls. **Both helpers use
-  `claude-haiku-4-5`** (constant `discovery.MODEL_HAIKU`) — they're narrow
-  extraction tasks where Haiku performs at parity with Sonnet for ~⅓ the cost.
-  A 3-professor run lands at ~$0.025 of Claude spend.
+  `_llm_pick_topics` call per pass + one `_llm_extract_email` call per *new* candidate
+  enriched. For a single-pass 10-person run that's ~31 calls; top-up passes add more.
+  **Both helpers use `claude-haiku-4-5`** (constant `discovery.MODEL_HAIKU`) — they're
+  narrow extraction tasks where Haiku performs at parity with Sonnet for ~⅓ the cost.
+  A single-pass 3-professor run lands at ~$0.025 of Claude spend. Note the top-up loop
+  itself spends **no** drafting (Sonnet) tokens — drafting starts only after the loop
+  settles, so a short field costs Sonnet only for the professors actually delivered.
 - The `_request_with_retry` helper retries 429 + 5xx with exponential backoff (1s,
   2s, 4s) and honors `Retry-After`. Three attempts max; the third failure raises.
 
@@ -319,7 +574,8 @@ worse than false negatives (losing a legitimate candidate).
 | `OpenAlex returned no topics for field 'comp neuro'` | Field is too colloquial | Try the standard term: `"computational neuroscience"` |
 | `Could not match field 'X' to an OpenAlex topic` | Topics found but LLM rejected all | The pick prompt got too strict — try a synonym, or relax the prompt |
 | `OpenAlex returned no authors for field 'X'` | Topic matched but no qualifying authors | Topic is too narrow / too new; broaden the field |
-| `Wanted N professors but only M survived...` | Email resolution drop rate higher than expected | Either accept M, raise OVERFETCH_MULTIPLIER, or improve the Tavily query |
+| `Wanted N professors but only M survived...` (log warning, single pass) | Email resolution drop rate higher than expected on that pass | Informational — the CLI top-up loop will discover more. A persistent shortfall surfaces as the partial-delivery warning below |
+| `Found M of N professors with a matched project. Drafting the M we have.` (warning, exit 0, run ends in REVIEW) | The field couldn't supply `count` professors with both an academic email and a matchable project, even after top-up | This is a successful **partial delivery**, not a failure: the M matched professors are drafted. To get closer to `count`, broaden the field, lower the count, or rerun later. Discovered professors + matches stay saved |
 | `ANTHROPIC_API_KEY is not set` / `TAVILY_API_KEY is not set` | Missing env var | Add to `.env` |
 | `Tavily returned 429 (rate limit / quota exhausted)...` | Monthly Tavily quota used up (free tier ~1000/month) | Wait until next billing cycle, lower the requested count, or upgrade. A run uses `count × 3` Tavily requests. |
 | Retried HTTP 429/503 still failing (OpenAlex) | Upstream actually unavailable | Wait + retry the run; check OpenAlex status |

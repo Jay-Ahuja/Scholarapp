@@ -28,13 +28,21 @@ from scholarapp.config import load_settings
 from scholarapp.db import repo
 from scholarapp.db.models import DraftStatus, Project, RunStatus
 from scholarapp.db.session import get_session
-from scholarapp.errors import IngestionError, NotFoundError, ScholarError
+from scholarapp.errors import (
+    DiscoveryError,
+    IngestionError,
+    MatchingError,
+    NotFoundError,
+    ScholarError,
+)
 from scholarapp.modules import (
     delivery,
     discovery,
     drafting,
     ingestion,
     matching,
+)
+from scholarapp.modules import (
     review as review_module,
 )
 
@@ -45,6 +53,19 @@ class PipelineStage(str, enum.Enum):
     parse = "parse"
     discovery = "discovery"
     matching = "matching"
+
+
+# Runaway guard for the discover→match top-up loop: 1 initial pass + up to 9
+# top-ups. Each pass excludes everything found so far so passes make progress;
+# this constant only bounds pathological cases where progress stalls in a way
+# the zero-new-qualifiers termination doesn't already catch.
+MAX_DISCOVERY_PASSES = 10
+
+# Termination for the top-up loop when passes keep surfacing professors but none
+# of them add a NEW matched professor. Stop after this many CONSECUTIVE empty
+# batches (genuine field exhaustion — a pass that returns zero candidates — is a
+# separate, immediate break and is NOT counted toward this streak).
+MAX_EMPTY_TOPUP_BATCHES = 5
 
 
 logging.basicConfig(
@@ -127,7 +148,8 @@ def init() -> None:
             ui.info("  2. Configure the OAuth consent screen (External, testing mode)")
             ui.info("  3. Create OAuth credentials (type: Desktop app)")
             ui.info(
-                f"  4. Download client_secret.json → place at [bold]{settings.client_secret_path}[/bold]"
+                "  4. Download client_secret.json → place at "
+                f"[bold]{settings.client_secret_path}[/bold]"
             )
             ui.info("  5. Re-run [bold cyan]scholar init[/bold cyan]")
             ui.info("  Full walkthrough: [bold]docs/08-delivery.md[/bold]")
@@ -164,6 +186,135 @@ def _parse_resume_cached(pdf_path: Path) -> ingestion.ResumeData:
     return data
 
 
+def _discover_and_persist(
+    *,
+    run_id: str,
+    field: str,
+    count: int,
+    interests: list[str],
+    exclude_ids: set[str],
+) -> tuple[list[discovery.ProfessorCandidate], list[str], set[str]]:
+    """Discover `count` NEW professors (excluding `exclude_ids`) and persist them.
+
+    Returns `(candidates, new_professor_ids, attempted_ids)` so the caller can
+    report, grow `exclude_ids` by EVERY author this pass paid to enrich
+    (`attempted_ids`, not just the survivors), and match ONLY the newly persisted
+    professors. Excluding all attempted authors — including those dropped for
+    lacking an email — keeps later passes from re-pulling and re-paying for the
+    same top-cited people. Professors + their projects are written here; matching
+    happens separately.
+    """
+    result = asyncio.run(
+        discovery.find_professors(
+            field=field,
+            count=count,
+            user_interests=interests,
+            exclude_ids=exclude_ids,
+        )
+    )
+    candidates = result.professors
+    new_professor_ids: list[str] = []
+    with get_session() as session:
+        for c in candidates:
+            prof = repo.add_professor(
+                session,
+                run_id=run_id,
+                name=c.name,
+                institution=c.institution,
+                email=c.email,
+                openalex_id=c.openalex_id,
+                faculty_page_url=c.faculty_page_url,
+            )
+            new_professor_ids.append(prof.id)
+            for w in c.recent_works:
+                repo.add_project(
+                    session,
+                    professor_id=prof.id,
+                    title=w.title,
+                    url=w.url,
+                    year=w.year,
+                    abstract=w.abstract,
+                    raw_json={"openalex_id": w.openalex_id},
+                )
+    return candidates, new_professor_ids, result.attempted_ids
+
+
+def _match_and_persist(
+    *,
+    professor_ids: list[str],
+    interests: list[str],
+    experiences_text: str,
+) -> None:
+    """Match projects for ONLY the given professors and persist the matches.
+
+    Used both for the initial pool and for each top-up batch — top-up must not
+    re-match (and re-pay for) professors already matched earlier in the run.
+    """
+    if not professor_ids:
+        return
+
+    matched_prof_ids: list[str] = []  # parallel to `pairs`, in the same order
+    with get_session() as session:
+        pairs: list[tuple[str, list[matching.ProjectForMatching]]] = []
+        for pid in professor_ids:
+            prof = repo.get_professor(session, pid)
+            if prof is None:
+                continue
+            projects = repo.list_projects_for_professor(session, prof.id)
+            matched_prof_ids.append(prof.id)
+            pairs.append(
+                (
+                    prof.name,
+                    [
+                        matching.ProjectForMatching(
+                            project_id=pr.id,
+                            title=pr.title,
+                            url=pr.url,
+                            abstract=pr.abstract,
+                            year=pr.year,
+                        )
+                        for pr in projects
+                    ],
+                )
+            )
+
+    if not pairs:
+        return
+
+    matched_lists = asyncio.run(
+        matching.match_projects_for_run(
+            pairs=pairs,
+            user_interests=interests,
+            user_experiences=experiences_text,
+        )
+    )
+
+    with get_session() as session:
+        for prof_id, matches in zip(matched_prof_ids, matched_lists, strict=True):
+            for m in matches:
+                repo.add_matched_project(
+                    session,
+                    professor_id=prof_id,
+                    project_id=m.project_id,
+                    why_relevant=m.why_relevant,
+                )
+
+
+def _count_professors_with_matches(run_id: str) -> int:
+    """Number of professors in this run with >=1 matched project.
+
+    This is exactly the set drafting keeps, so it's the `have` the exact-N gate
+    compares against `count`.
+    """
+    with get_session() as session:
+        professors = repo.list_professors_for_run(session, run_id)
+        return sum(
+            1
+            for prof in professors
+            if repo.list_matched_projects_for_professor(session, prof.id)
+        )
+
+
 @app.command("run")
 def run(
     inputs: Path = typer.Option(
@@ -178,7 +329,9 @@ def run(
         case_sensitive=False,
     ),
 ) -> None:
-    """End-to-end: parse inputs, discover professors, match relevant works, draft personalized emails. Drafts saved to the DB; `scholar review` writes them as markdown for editing."""
+    "End-to-end: parse inputs, discover professors, match relevant works, draft " \
+    "personalized emails. Drafts saved to the DB; `scholar review` writes them as " \
+    "markdown for editing."
 
     def _impl() -> None:
         tracker = usage_tracker.UsageTracker()
@@ -250,23 +403,33 @@ def run(
             ui.info("[dim]Stopped after parse as requested (--stop-after parse).[/dim]")
             return
 
+        count = prompt_data.count
+        field = prompt_data.field
+        interests = resume_data.interests
+        experiences_text = _summarize_experiences(resume_data.experiences)
+
         # --- Discover ----------------------------------------------------------
         ui.section("Discover")
 
         with get_session() as session:
             repo.update_run_status(session, run_id, RunStatus.DISCOVERING)
 
+        # OpenAlex IDs seen this run — grows every pass so top-ups never re-pay
+        # for the same top-cited authors and OpenAlex returns NEW candidates.
+        seen_openalex_ids: set[str] = set()
+
+        # Initial pass: discovery + matching keep today's fatal-on-error behavior.
         try:
             with ui.spinner(
-                f"Discovering up to {prompt_data.count} professors in "
-                f"[italic]{prompt_data.field}[/italic]..."
+                f"Discovering up to {count} professors in "
+                f"[italic]{field}[/italic]..."
             ):
-                candidates = asyncio.run(
-                    discovery.find_professors(
-                        field=prompt_data.field,
-                        count=prompt_data.count,
-                        user_interests=resume_data.interests,
-                    )
+                candidates, new_prof_ids, attempted_ids = _discover_and_persist(
+                    run_id=run_id,
+                    field=field,
+                    count=count,
+                    interests=interests,
+                    exclude_ids=seen_openalex_ids,
                 )
         except ScholarError as e:
             with get_session() as session:
@@ -275,30 +438,14 @@ def run(
                 )
             raise
 
-        with get_session() as session:
-            for c in candidates:
-                prof = repo.add_professor(
-                    session,
-                    run_id=run_id,
-                    name=c.name,
-                    institution=c.institution,
-                    email=c.email,
-                    openalex_id=c.openalex_id,
-                    faculty_page_url=c.faculty_page_url,
-                )
-                for w in c.recent_works:
-                    repo.add_project(
-                        session,
-                        professor_id=prof.id,
-                        title=w.title,
-                        url=w.url,
-                        year=w.year,
-                        abstract=w.abstract,
-                        raw_json={"openalex_id": w.openalex_id},
-                    )
-            repo.update_run_status(session, run_id, RunStatus.MATCHING)
-
+        # Exclude EVERY author this pass paid to enrich — survivors AND the
+        # email-less discards — so the first top-up advances to deeper ranks
+        # instead of re-pulling and re-paying for this pass's discards.
+        seen_openalex_ids.update(attempted_ids)
         ui.professors_table(candidates)
+
+        with get_session() as session:
+            repo.update_run_status(session, run_id, RunStatus.MATCHING)
 
         if stop_after == PipelineStage.discovery:
             ui.info("[dim]Stopped after discovery as requested (--stop-after discovery).[/dim]")
@@ -307,40 +454,12 @@ def run(
         # --- Match -------------------------------------------------------------
         ui.section("Match")
 
-        with get_session() as session:
-            professors = repo.list_professors_for_run(session, run_id)
-            pairs: list[tuple[str, list[matching.ProjectForMatching]]] = []
-            for prof in professors:
-                projects = repo.list_projects_for_professor(session, prof.id)
-                pairs.append(
-                    (
-                        prof.name,
-                        [
-                            matching.ProjectForMatching(
-                                project_id=pr.id,
-                                title=pr.title,
-                                url=pr.url,
-                                abstract=pr.abstract,
-                                year=pr.year,
-                            )
-                            for pr in projects
-                        ],
-                    )
-                )
-
-        if not pairs:
-            ui.warn("No professors to match — skipping.")
-            return
-
-        experiences_text = _summarize_experiences(resume_data.experiences)
         try:
-            with ui.spinner(f"Matching projects for {len(pairs)} professors..."):
-                matched_lists = asyncio.run(
-                    matching.match_projects_for_run(
-                        pairs=pairs,
-                        user_interests=resume_data.interests,
-                        user_experiences=experiences_text,
-                    )
+            with ui.spinner(f"Matching projects for {len(new_prof_ids)} professors..."):
+                _match_and_persist(
+                    professor_ids=new_prof_ids,
+                    interests=interests,
+                    experiences_text=experiences_text,
                 )
         except ScholarError as e:
             with get_session() as session:
@@ -349,31 +468,153 @@ def run(
                 )
             raise
 
-        with get_session() as session:
-            total_matches = 0
-            professors_with_matches = 0
-            for prof, matches in zip(professors, matched_lists):
-                if matches:
-                    professors_with_matches += 1
-                for m in matches:
-                    repo.add_matched_project(
-                        session,
-                        professor_id=prof.id,
-                        project_id=m.project_id,
-                        why_relevant=m.why_relevant,
-                    )
-                    total_matches += 1
-            repo.update_run_status(session, run_id, RunStatus.DRAFTING)
-
+        have = _count_professors_with_matches(run_id)
         ui.info(
-            f"[green]✓[/green] Matched projects for [bold]{len(pairs)}[/bold] professors "
-            f"([green]{professors_with_matches}[/green] with ≥1 match, "
-            f"[bold]{total_matches}[/bold] matches total)."
+            f"[green]✓[/green] {have} professor(s) with ≥1 matched project "
+            f"(target {count})."
         )
 
+        # --- Top-up loop -------------------------------------------------------
+        # Checkpoint AFTER matching, BEFORE drafting. Keep discovering+matching
+        # NEW professors until we have `count` with a match, the field is
+        # exhausted (a pass surfaces zero new authors at all — empty
+        # attempted_ids), MAX_EMPTY_TOPUP_BATCHES consecutive passes add no new
+        # matched professor, or the runaway guard trips. None of these is fatal:
+        # on shortfall we deliver partially below.
+        # Mid-loop DiscoveryError/MatchingError break the loop quietly.
+        passes = 1  # the initial pass above counts as pass 1
+        empty_batches = 0  # consecutive top-up passes that added no new match
+        while have < count:
+            if passes >= MAX_DISCOVERY_PASSES:
+                # Runaway guard. Should be unreachable in practice (the zero-new
+                # and empty-streak terminations fire first). Stop and fall
+                # through to partial delivery — never fatal.
+                ui.warn(
+                    f"Stopped top-up after {MAX_DISCOVERY_PASSES} passes with "
+                    f"{have} of {count} professors."
+                )
+                break
+
+            shortfall = count - have
+            passes += 1
+            ui.info(
+                f"[dim]Top-up pass {passes}: discovering {shortfall} more "
+                f"professor(s) ({have}/{count} so far)...[/dim]"
+            )
+
+            try:
+                with ui.spinner(
+                    f"Discovering {shortfall} more professors in "
+                    f"[italic]{field}[/italic]..."
+                ):
+                    topup_candidates, topup_prof_ids, topup_attempted_ids = (
+                        _discover_and_persist(
+                            run_id=run_id,
+                            field=field,
+                            count=shortfall,
+                            interests=interests,
+                            exclude_ids=seen_openalex_ids,
+                        )
+                    )
+            except (DiscoveryError, MatchingError) as e:
+                # Mid-loop error: break (do NOT mark FAILED / re-raise here). The
+                # gate below handles the resulting shortfall.
+                ui.warn(f"Top-up discovery stopped early: {e}")
+                break
+
+            # Grow exclude by EVERY author this pass paid to enrich (survivors +
+            # discards) BEFORE the field-exhaustion check — even a pass that
+            # surfaces no email-validated survivor still paid for its pool, and
+            # the next pass must not re-pull it.
+            seen_openalex_ids.update(topup_attempted_ids)
+
+            if not topup_attempted_ids:
+                # Genuine field exhaustion — discovery surfaced NO new authors at
+                # all this pass (nothing pulled, nothing paid for). Stop. A pass
+                # that DID pull authors but had them all dropped at email
+                # validation is NOT exhaustion: it has explored deeper ranks and
+                # is handled by the empty-batch streak below.
+                ui.info("[dim]No new professors available — field exhausted.[/dim]")
+                break
+
+            # New authors were pulled this pass. Match only the newly-persisted
+            # professors. If every pulled author was dropped at email validation
+            # (no new professor persisted), skip the match step entirely — there
+            # is nothing to match — and let the non-productive-pass logic below
+            # count this toward the empty-batch streak.
+            if topup_prof_ids:
+                ui.professors_table(topup_candidates)
+                try:
+                    with ui.spinner(
+                        f"Matching projects for {len(topup_prof_ids)} new professors..."
+                    ):
+                        _match_and_persist(
+                            professor_ids=topup_prof_ids,
+                            interests=interests,
+                            experiences_text=experiences_text,
+                        )
+                except (DiscoveryError, MatchingError) as e:
+                    ui.warn(f"Top-up matching stopped early: {e}")
+                    break
+
+            new_have = _count_professors_with_matches(run_id)
+            if new_have > have:
+                # Progress: this pass added at least one newly matched professor.
+                # Reset the empty-batch streak.
+                have = new_have
+                empty_batches = 0
+                continue
+
+            # Non-productive pass: this pass pulled new authors but added no
+            # newly-matched professor. Either every pulled author was dropped at
+            # email validation (no survivors to match), or survivors matched no
+            # project. Both causes are treated UNIFORMLY — each counts one toward
+            # the same consecutive-empty streak; only stop once the streak reaches
+            # MAX_EMPTY_TOPUP_BATCHES.
+            have = new_have
+            empty_batches += 1
+            if empty_batches >= MAX_EMPTY_TOPUP_BATCHES:
+                ui.info(
+                    f"[dim]Top-up produced no newly matched professors in "
+                    f"{MAX_EMPTY_TOPUP_BATCHES} consecutive passes — stopping.[/dim]"
+                )
+                break
+
+        # --- Exact-N gate ------------------------------------------------------
         if stop_after == PipelineStage.matching:
+            if have < count:
+                ui.warn(
+                    f"Found {have} of {count} requested professors with a matched "
+                    f"project. Field {field!r} may be too narrow, Tavily quota may "
+                    "be exhausted, or few projects matched your interests."
+                )
+            else:
+                ui.info(
+                    f"[green]✓[/green] Reached target: {have} of {count} professors "
+                    "with a matched project."
+                )
             ui.info("[dim]Stopped after matching as requested (--stop-after matching).[/dim]")
             return
+
+        # Partial delivery: a shortfall is NOT fatal. Warn, then draft whatever
+        # matched professors we have. A short run is a successful partial
+        # delivery and ends in RunStatus.REVIEW like any other run.
+        if have < count:
+            ui.warn(
+                f"Found {have} of {count} professors with a matched project. "
+                f"Drafting the {have} we have. Likely cause: the field {field!r} "
+                "is too narrow, the Tavily quota is exhausted, or too few of the "
+                "discovered projects matched your interests. Try a broader field, "
+                "a lower count, or rerun later."
+            )
+        else:
+            ui.info(
+                f"[green]✓[/green] Reached target: {have} of {count} professors "
+                "with a matched project."
+            )
+
+        with get_session() as session:
+            repo.update_run_status(session, run_id, RunStatus.DRAFTING)
 
         # --- Draft -------------------------------------------------------------
         ui.section("Draft")
@@ -382,8 +623,13 @@ def run(
             draft_requests: list[drafting.DraftRequest] = []
             request_to_prof_id: list[str] = []
             for prof in repo.list_professors_for_run(session, run_id):
+                # Draft exactly `count` — `have` can overshoot if a top-up pass
+                # surfaced more matchable professors than the shortfall needed.
+                if len(draft_requests) >= count:
+                    break
                 matched_rows = repo.list_matched_projects_for_professor(session, prof.id)
                 if not matched_rows:
+                    # NEVER draft a professor with no matched project.
                     ui.warn(f"skipping {prof.name} — no matched projects")
                     continue
                 matched_pydantic: list[matching.MatchedProject] = []
@@ -437,7 +683,7 @@ def run(
             raise
 
         with get_session() as session:
-            for prof_id, email_draft in zip(request_to_prof_id, email_drafts):
+            for prof_id, email_draft in zip(request_to_prof_id, email_drafts, strict=True):
                 repo.add_draft(
                     session,
                     run_id=run_id,

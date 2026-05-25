@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import dataclass
 from importlib.resources import files
 from typing import Any
 
@@ -104,6 +105,18 @@ class ProfessorCandidate(BaseModel):
                 "see scholarapp.modules.discovery.ACADEMIC_EMAIL_SUFFIXES."
             )
         return v
+
+
+# A frozen value type bundling a discovery pass's email-validated survivors with
+# the full set of authors that incurred a paid enrichment lookup this pass. The
+# CLI top-up loop excludes ALL attempted authors (not just survivors) so later
+# passes never re-pull and re-pay for top-cited authors that were dropped for
+# lacking an email. Frozen @dataclass — mirrors Settings (config.py) / CallRecord
+# (usage.py); NOT Pydantic.
+@dataclass(frozen=True)
+class DiscoveryResult:
+    professors: list[ProfessorCandidate]  # email-validated survivors, capped at `count`
+    attempted_ids: set[str]  # short OpenAlex author IDs of EVERY author enriched this pass
 
 
 # Internal extraction schemas used as Anthropic tool input_schemas.
@@ -508,6 +521,22 @@ async def _list_authors(
     return response.json().get("results", [])[:target_count]
 
 
+def _filter_excluded(authors: list[dict], exclude_ids: set[str]) -> list[dict]:
+    """Drop authors whose short OpenAlex ID is in `exclude_ids`.
+
+    Applied BEFORE enrichment so excluded authors cost no Tavily/Haiku. The key is
+    the same short form as `ProfessorCandidate.openalex_id` and `_short_id` output.
+    """
+    if not exclude_ids:
+        return authors
+    kept: list[dict] = []
+    for author in authors:
+        if _short_id(author.get("id") or "") in exclude_ids:
+            continue
+        kept.append(author)
+    return kept
+
+
 async def _fetch_recent_works(http: httpx.AsyncClient, author_id: str) -> list[dict]:
     short = _short_id(author_id)
     response = await _request_with_retry(
@@ -599,15 +628,37 @@ async def _safe_works(http: httpx.AsyncClient, author_id: str, name: str) -> lis
 
 
 async def find_professors(
-    field: str, count: int, user_interests: list[str]
-) -> list[ProfessorCandidate]:
+    field: str,
+    count: int,
+    user_interests: list[str],
+    *,
+    exclude_ids: set[str] | None = None,
+) -> DiscoveryResult:
     """Discover up to `count` professors in `field` with verified academic emails.
+
+    Returns a `DiscoveryResult` bundling the email-validated survivors
+    (`professors`, capped at `count`) with `attempted_ids` — the short OpenAlex
+    IDs of EVERY author this pass ran through enrichment (the full pool the
+    asyncio.gather enriched, survivors included). Every attempted author incurred
+    a paid Tavily search + Haiku extraction, so the CLI top-up loop excludes all
+    of them — not just survivors — to avoid re-pulling and re-paying for the same
+    top-cited authors that were dropped for lacking an email.
 
     `user_interests` is accepted for future use (e.g., narrowing the author pool)
     but not currently consulted — matching against interests happens in Step 5.
+
+    `exclude_ids` holds short-form OpenAlex author IDs (same form as
+    `ProfessorCandidate.openalex_id`) already discovered earlier in this run. They
+    are filtered out BEFORE enrichment so they cost no Tavily/Haiku, and the
+    OpenAlex fetch is sized up by `len(exclude_ids)` so that — after removing the
+    excluded top-cited authors — up to `count` NEW candidates can still surface.
+    A naive re-fetch would just return the same top-cited authors, so the top-up
+    loop in the CLI relies on this to make progress across passes.
     """
     if count <= 0:
-        return []
+        return DiscoveryResult(professors=[], attempted_ids=set())
+
+    exclude_ids = exclude_ids or set()
 
     # Reset the Tavily rate-limit circuit breaker for this fresh run.
     _tavily_rate_limited.clear()
@@ -628,7 +679,10 @@ async def find_professors(
         )
         logger.info("Resolved field %r to topic ids %s", field, topic_ids)
 
-        target_pool = count * OVERFETCH_MULTIPLIER
+        # Over-fetch by OVERFETCH_MULTIPLIER (email resolution drops candidates)
+        # AND by len(exclude_ids) so the already-seen top-cited authors we'll drop
+        # don't eat into the `count` NEW candidates we still want this pass.
+        target_pool = (count + len(exclude_ids)) * OVERFETCH_MULTIPLIER
         authors = await _list_authors(http, topic_ids, target_pool)
         if not authors:
             raise DiscoveryError(
@@ -636,6 +690,10 @@ async def find_professors(
                 "The topic may be too narrow."
             )
         logger.info("OpenAlex returned %d candidate authors", len(authors))
+
+        # Filter out IDs already discovered earlier in this run BEFORE enrichment
+        # so excluded authors never trigger a paid Tavily search + Claude call.
+        authors = _filter_excluded(authors, exclude_ids)
 
         # Within-run dedup BEFORE enrichment: a professor that OpenAlex surfaces
         # more than once must be looked up at most once so we don't pay twice for
@@ -671,6 +729,12 @@ async def find_professors(
                     "email": email,
                     "faculty_page_url": page,
                 }
+
+        # Every author in this pool is about to be enriched (paid Tavily + Haiku).
+        # Capture their short IDs BEFORE the gather so attempted_ids reflects the
+        # whole paid pool — not just the survivors. The survivor loop below breaks
+        # early once it has `count`, but the entire pool was already enriched/paid.
+        attempted_ids = {_short_id(a.get("id") or "") for a in authors if a.get("id")}
 
         enriched = await asyncio.gather(
             *[_enrich(a) for a in authors], return_exceptions=False
@@ -722,7 +786,7 @@ async def find_professors(
             count,
             len(final),
         )
-    return final[:count]
+    return DiscoveryResult(professors=final[:count], attempted_ids=attempted_ids)
 
 
 def _pick_work_url(work: dict) -> str | None:
