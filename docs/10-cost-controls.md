@@ -54,11 +54,17 @@ The flow:
    whatever professors already have a match (possibly zero) and ends in
    `RunStatus.REVIEW` like any normal short run. The end-of-run summary then
    shows `ui.budget_stop_notice(budget_usd, spent_usd)`.
-6. **Persistence of actual cost.** At each terminal drafting path,
-   `_persist_run_usage(run_id, count, tracker)` writes one `RunUsage` row via
-   `repo.add_run_usage`. `_recent_cost_history()` reads those rows back through
-   `repo.list_recent_run_usage` and maps them to `RunCostSample`s that feed the
-   next run's estimate.
+6. **Persistence of actual cost AND realized size.** At each terminal drafting
+   path, `_persist_run_usage(run_id, count, drafted, tracker)` writes one
+   `RunUsage` row via `repo.add_run_usage`. Besides each stage's realized USD
+   cost, it records how many professors each stage *actually* processed —
+   discovery = professors persisted for the run, matching = professors with
+   `>=1` matched project, drafting = professors actually drafted — so future
+   estimates divide spend by the size that produced it rather than the requested
+   `count`. `_recent_cost_history()` reads those rows back through
+   `repo.list_recent_run_usage`, unpacks each row's JSON via
+   `usage.unpack_stage_usage`, and maps them to `RunCostSample`s (carrying both
+   `stage_costs` and `stage_counts`) that feed the next run's estimate.
 
 The cost engine (`scholarapp/usage.py`) is intentionally **DB-free and pure** —
 the CLI owns all ORM translation and persistence. See
@@ -70,7 +76,7 @@ history lives in a new `RunUsage` table rather than new columns on `runs`.
 | File | Role in this feature |
 |---|---|
 | `scholarapp/cli.py` | `run` command: `--budget`/`--yes` options, estimate+confirm gate, `_over_budget`, `_recent_cost_history`, `_persist_run_usage`, budget-stop wiring |
-| `scholarapp/usage.py` | `STAGES`, `estimate_run_cost`, `stage_costs_from_tracker`, `StageEstimate`/`CostEstimate`/`RunCostSample` dataclasses (plus the pre-existing `PRICING`/`UsageTracker`) |
+| `scholarapp/usage.py` | `STAGES`, `estimate_run_cost`, `stage_costs_from_tracker`, `pack_stage_usage`/`unpack_stage_usage`, `StageEstimate`/`CostEstimate`/`RunCostSample` dataclasses (plus the pre-existing `PRICING`/`UsageTracker`) |
 | `scholarapp/config.py` | `Settings.run_max_usd`, `_env_float`, `RUN_MAX_USD` env parsing |
 | `scholarapp/db/models.py` | `RunUsage` table |
 | `scholarapp/db/repo.py` | `add_run_usage`, `list_recent_run_usage` |
@@ -113,8 +119,12 @@ history lives in a new `RunUsage` table rather than new columns on `runs`.
   — `total_usd == sum(s.cost_usd for s in stages)`; `basis` is `"historical"` or
   `"static"`; `sample_size` is the number of runs averaged (0 when static).
 - `StageEstimate(stage, cost_usd)` — one per `STAGES` key, in `STAGES` order.
-- `RunCostSample(count, stage_costs: dict[str, float])` — one prior run's
-  realized cost, the estimator's history input.
+- `RunCostSample(count, stage_costs: dict[str, float], stage_counts: dict[str, int])`
+  — one prior run's realized cost, the estimator's history input. `stage_counts`
+  is the realized professor count each stage processed; the rate math divides
+  `stage_costs[stage]` by `stage_counts[stage]`, not by `count`. `count` is
+  retained for reference only. Legacy samples carry an empty `stage_counts` and
+  are excluded per-stage from averaging.
 
 ## 6. State and data
 
@@ -126,9 +136,21 @@ run:
 | `id` | autoincrement PK |
 | `run_id` | FK to `runs.id`, indexed |
 | `created_at` | timestamp |
-| `count` | professors requested for that run |
-| `total_usd` | denormalized sum of `stage_costs` (cheap newest-first listing) |
-| `stage_costs` | JSON object keyed by `usage.STAGES` |
+| `count` | professors requested for that run (reference only — NOT used for rate math) |
+| `total_usd` | denormalized sum of the per-stage costs (cheap newest-first listing) |
+| `stage_costs` | JSON; a tagged value `{"costs": {stage: float}, "counts": {stage: int}}` keyed by `usage.STAGES` |
+
+The `stage_costs` column now carries BOTH the per-stage USD costs and the
+per-stage *realized* professor counts (how many professors each stage actually
+processed) inside one JSON value. Because the project has no migrations
+(`create_all` cannot ALTER a table to add a column), the realized counts ride in
+the existing column rather than a new one — see
+[adr/0002-per-stage-realized-counts.md](adr/0002-per-stage-realized-counts.md).
+`usage.pack_stage_usage` writes the tagged shape; `usage.unpack_stage_usage`
+reads it back into `(stage_costs, stage_counts)`. **Legacy rows** persisted
+before this change are the bare `{stage: float}` cost map (no `"costs"`/`"counts"`
+keys); `unpack_stage_usage` detects them by key absence and returns them as
+costs-only with an empty counts dict, so old history never crashes the reader.
 
 `total_usd` is summed from the per-stage costs (not `tracker.total_cost_usd`) so
 it stays consistent with the stored `stage_costs`, which deliberately exclude
@@ -139,14 +161,24 @@ in `init_db()` (`scholarapp/db/session.py`) — no migration step, and it appear
 on both fresh and pre-existing `scholar.db` files. See
 [adr/0001-cost-history-table.md](adr/0001-cost-history-table.md).
 
-**How history feeds estimates.** `estimate_run_cost` switches to a *historical*
-basis once at least `_MIN_HISTORY_SAMPLES` (currently 3) usable prior runs
-exist. It pools per-stage totals across those runs and divides by total
-professors to get a per-professor rate, then scales by the current `count`
-(weighting larger runs more). With fewer samples it falls back to the *static*
-PRICING-derived guess (`_STATIC_PER_PROF_USD` per professor plus a fixed
-per-run `_STATIC_FIXED_USD` discovery add-on for `pick_topics`). Samples with
-`count <= 0` are skipped; if none are usable it falls back to static.
+**How history feeds estimates.** `estimate_run_cost` computes each stage's rate
+*independently* from its *realized* counts: it pools a stage's spend and its
+realized professor count over the samples that recorded a positive count for
+that stage, computing `rate[stage] = pooled stage cost / pooled stage realized
+count`, then scales by the current `count`. Dividing by the realized per-stage
+count — not the requested `count` — is the fix this change introduces: a short,
+partial, or budget-stopped run processes fewer professors than requested, so
+dividing its spend by `count` would understate the per-professor rate and drag
+future estimates downward. Using realized counts, a half-completed run reports
+the same per-professor rate as a full one. A stage switches to this *historical*
+basis once at least `_MIN_HISTORY_SAMPLES` (currently 3) count-bearing samples
+exist for it; otherwise that stage falls back to the *static* PRICING-derived
+guess (`_STATIC_PER_PROF_USD` per professor plus a fixed per-run
+`_STATIC_FIXED_USD` discovery add-on for `pick_topics`). Legacy samples (empty
+`stage_counts`) contribute no realized-count signal and are simply absent from
+every stage's pool, so a history mixing new and legacy rows estimates without
+error. If no stage has enough count-bearing history, the whole estimate is
+static.
 
 ## 7. Configuration
 
@@ -219,6 +251,18 @@ protects them.
   terminal drafting path (including "nothing to draft"), so a run records its
   sample exactly once. Failed / refused / declined runs write nothing, so they
   never pollute the history.
+- **Requested `count` is recorded but NOT used for rate math.** The stored
+  `count` is the requested target; the per-professor rate divides spend by the
+  *realized* per-stage count instead. `count` is kept only for reference/context.
+- **Legacy samples are excluded per-stage, not crashed on.** Rows persisted
+  before this change carry no realized counts (empty `stage_counts` after
+  `unpack_stage_usage`), so they are dropped from each stage's averaging pool
+  rather than read incorrectly. Estimation over a mixed new/legacy history is
+  graceful and never raises.
+- **Full runs estimate the same as before.** When a stage processes all
+  requested professors, its realized count equals `count`, so dividing spend by
+  the realized count yields the same per-professor rate as dividing by `count`
+  did — this change only corrects short/partial/budget-stopped samples.
 
 ## 9. Testing
 
