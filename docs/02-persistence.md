@@ -160,13 +160,14 @@ the same cache entry. See [docs/03-ingestion.md](03-ingestion.md#resume-parse-ca
 ```
                        ┌──> failed (sink; populated alongside error)
                        │
-pending ─> parsing ─> discovering ─> matching ─> drafting ─> review ─> done
+pending ─> discovering ─> matching ─> drafting ─> review     done (defined, unused)
 ```
 
-- `pending` is the initial state at row creation.
-- The pipeline advances through `parsing`, `discovering`, `matching`, `drafting`, `review` (drafts written to disk).
-- `done` is set after the user runs `scholar send` (or `scholar approve` if you treat review as terminal).
-- `failed` is reachable from any stage; the corresponding `error` field is populated with a user-readable reason.
+- `pending` is the initial state at row creation (the `Run` row defaults to it).
+- The pipeline advances through `discovering`, `matching`, `drafting`, and ends at `review` — the terminal success state. `scholar run` sets `RunStatus.REVIEW` once drafts are written to the DB and never advances past it.
+- `parsing` is a defined member of the enum but the current pipeline does not set it: `scholar run` parses inputs while the `Run` row is still `pending`, then jumps to `discovering`. It is reserved for a future explicit parse phase.
+- **`done` is defined in the enum but never set.** No command transitions a run to `done` — neither `scholar send` nor `scholar approve` writes it. The pipeline's terminal state is `review`. Treat `done` as a reserved, not-yet-reached outcome.
+- `failed` is reachable from discovery, matching, or drafting; the corresponding `error` field is populated with a user-readable reason. (A discovery shortfall is *not* fatal — it still ends in `review` as a partial delivery.)
 
 ### `DraftStatus`
 
@@ -244,8 +245,8 @@ If a query is being copy/pasted across modules, lift it into `repo.py`. Until th
 
 ```bash
 sqlite3 ~/.scholarapp/scholar.db '.tables'
-# matched_projects  professors  send_logs
-# projects          runs        drafts
+# drafts            professors    resume_cache  send_logs
+# matched_projects  projects      runs
 
 sqlite3 ~/.scholarapp/scholar.db 'select id, status, field, count from runs;'
 sqlite3 ~/.scholarapp/scholar.db -header -column \

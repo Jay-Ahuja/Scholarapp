@@ -266,23 +266,35 @@ EOF
 scholar run
 ```
 
-Expected output:
+Ingestion is the first stage `scholar run` executes; its output appears under the
+`Parse` section heading before the pipeline moves on to discovery, matching, and
+drafting:
 
 ```
+── Parse ──
 Parsing resume: inputs/resume.pdf
 Parsed resume for Jane Doe.
 Parsing prompt: inputs/prompt.md
 Parsed prompt: field='computational neuroscience', count=5, goal='30-min chat'
-Parsed inputs. run_id=<uuid>
+✓ Parsed inputs. run_id=<uuid>
 ```
 
-After the run completes, the inputs are copied to
-`~/.scholarapp/runs/<run_id>/inputs/` for reproducibility, and the Run row is in the
-DB. Verify with:
+To exercise ingestion in isolation without paying for discovery/matching/drafting,
+stop the pipeline right after parsing:
+
+```bash
+scholar run --stop-after parse
+```
+
+After parsing, the inputs are copied to `~/.scholarapp/runs/<run_id>/inputs/` for
+reproducibility, and the Run row is in the DB (status `pending` at this point, since
+the pipeline only advances the status once discovery starts). Verify with:
 
 ```bash
 scholar list
-scholar status <run_id>     # will show "(no drafts yet)" until Steps 4-6 land
+scholar status <run_id>     # "(no drafts yet)" if you stopped after parse
 ```
 
-The pipeline stops here — discovery (Step 4) is not yet wired up.
+Without `--stop-after`, `scholar run` continues through discovery (Step 4), matching
+(Step 5), and drafting (Step 6), ending at `RunStatus.REVIEW`. See
+[docs/04-discovery.md](04-discovery.md) onward for those stages.
