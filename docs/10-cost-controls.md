@@ -48,13 +48,37 @@ The flow:
    (already-recorded spend) against the ceiling with `>=`. It is checked
    *between* stages: pre-discovery, pre-matching, before each top-up pass, and
    pre-drafting. This is **best-effort**: a single stage can overshoot the
-   ceiling internally because a Claude call is never aborted mid-flight.
-5. **Partial delivery on stop.** Hitting the ceiling sets `stop_reason =
-   "budget"` and falls through to the existing partial-delivery path — it drafts
-   whatever professors already have a match (possibly zero) and ends in
-   `RunStatus.REVIEW` like any normal short run. The end-of-run summary then
-   shows `ui.budget_stop_notice(budget_usd, spent_usd)`.
-6. **Persistence of actual cost AND realized size.** At each terminal drafting
+   ceiling internally because a Claude call is never aborted mid-flight. The gate
+   also **fails closed on unpriced spend** (see below): once a budget is active,
+   `_over_budget` trips not only on recognized spend reaching the ceiling but also
+   if `tracker.has_unpriced_calls` is true.
+5. **Fail-closed on unpriced (unknown-model) spend — only under a budget.** Budget
+   accounting prices each call via the `PRICING` table in `scholarapp/usage.py`;
+   a call whose model id isn't in `PRICING` contributes `$0.00` to
+   `tracker.total_cost_usd` (`CallRecord.is_priced` is `False`) only because we
+   have *no rate for it*, not because it was free. Treating that as $0 would let
+   an unrecognized model id — e.g. after a model rollout or alias change — slip a
+   run past `--budget`/`RUN_MAX_USD` without ever tripping the stop. So
+   `_over_budget` now also returns `True` when `tracker.has_unpriced_calls` is
+   true. **Zero tolerance:** the mere presence of *any* unpriced call under an
+   active ceiling is itself the stop condition, regardless of how small the
+   recognized spend is. This is gated *behind* the `effective_budget is not None`
+   check, so a run with **no ceiling is unaffected** — unpriced calls there still
+   only surface in the end-of-run usage summary (the `UNPRICED_MARKER`), and the
+   run is not stopped. Like every ceiling check it lands at the next stage / pass
+   boundary, so within-stage overshoot still applies.
+6. **Partial delivery on stop.** Hitting the ceiling — whether from recognized
+   spend or from an unpriced call — sets `stop_reason = "budget"` and falls
+   through to the existing partial-delivery path: it drafts whatever professors
+   already have a match (possibly zero) and ends in `RunStatus.REVIEW` like any
+   normal short run. The end-of-run summary then shows
+   `ui.budget_stop_notice(budget_usd, spent_usd, unpriced=...)`, passing
+   `tracker.has_unpriced_calls` as the `unpriced` flag. That notice
+   **distinguishes the two cases**: a normal ceiling hit reads "spent $X of $Y
+   budget", while a fail-closed stop reports that some spend could not be
+   priced/measured against the budget — and notes that the shown spent figure
+   EXCLUDES those unaccountable calls (so true spend is higher than displayed).
+7. **Persistence of actual cost AND realized size.** At each terminal drafting
    path, `_persist_run_usage(run_id, count, drafted, tracker)` writes one
    `RunUsage` row via `repo.add_run_usage`. Besides each stage's realized USD
    cost, it records how many professors each stage *actually* processed —
@@ -227,6 +251,21 @@ protects them.
   calls (and a resume-cache hit makes the resume parse free).
 - **Refuse-to-start.** If the budget is below the estimated total, the run never
   discovers — `ui.error` + `Exit(1)`.
+- **Unpriced spend fails closed — under a budget only.** Budget accounting
+  prices calls via `PRICING`; a call whose model isn't in `PRICING` costs `$0.00`
+  to `tracker.total_cost_usd` only because we have no rate (`CallRecord.is_priced`
+  is `False`), not because it was free. So under an **active** ceiling the
+  boundary gate trips on the mere *presence* of any unpriced call
+  (`UsageTracker.has_unpriced_calls`) — **zero tolerance**, regardless of how
+  small the recognized spend is — preventing an unknown model id (e.g. after a
+  model rollout/alias change) from sliding a run past `--budget`/`RUN_MAX_USD`.
+  This is **gated to budgeted runs only**: with no ceiling, unpriced calls are
+  *not* a stop condition and only surface in the end-of-run usage summary (the
+  `UNPRICED_MARKER`). And because it's just another boundary check, **within-stage
+  overshoot still applies** — an unpriced call already made inside a stage isn't
+  caught until the next stage/pass boundary. The end-of-run
+  `ui.budget_stop_notice` flags this case separately (its `unpriced=True` line),
+  noting the shown spent figure excludes the unaccountable calls.
 - **A malformed budget is fail-closed.** A non-finite (`NaN`/`±inf`) or negative
   effective ceiling hard-stops the run before any spend, raising `ConfigError`
   (rendered by `_run_safely` as `ui.error` + `Exit(1)`). It is never silently
@@ -268,11 +307,11 @@ protects them.
 
 | Test file | Covers |
 |---|---|
-| `tests/test_usage.py` | `estimate_run_cost` (static vs historical basis, sample threshold, count scaling), `stage_costs_from_tracker`, dataclass invariants |
+| `tests/test_usage.py` | `estimate_run_cost` (static vs historical basis, sample threshold, count scaling), `stage_costs_from_tracker`, dataclass invariants, and the unpriced markers (`CallRecord.is_priced`, `UsageTracker.has_unpriced_calls`) |
 | `tests/test_config.py` | `RUN_MAX_USD` / `_env_float` parsing into `Settings.run_max_usd` |
 | `tests/test_run_usage_repo.py` | `add_run_usage` / `list_recent_run_usage` round-trip and ordering |
-| `tests/test_ui.py` | `cost_estimate_panel` and `budget_stop_notice` rendering |
-| `tests/test_cli_topup.py` | `scholar run` integration: estimate gate, refuse-to-start, confirm/decline, mid-run budget stop + partial delivery, and budget validation — malformed `--budget`/`RUN_MAX_USD` (`NaN`/`±inf`/negative) hard-stop, and a zero budget being a valid ceiling that refuses to start |
+| `tests/test_ui.py` | `cost_estimate_panel` and `budget_stop_notice` rendering (including the `unpriced=True` fail-closed variant) |
+| `tests/test_cli_topup.py` | `scholar run` integration: estimate gate, refuse-to-start, confirm/decline, mid-run budget stop + partial delivery, the fail-closed stop on unpriced spend (and that a no-budget run is unaffected), and budget validation — malformed `--budget`/`RUN_MAX_USD` (`NaN`/`±inf`/negative) hard-stop, and a zero budget being a valid ceiling that refuses to start |
 
 Run:
 
