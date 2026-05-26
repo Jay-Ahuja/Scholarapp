@@ -230,10 +230,10 @@ this:
   an `_AuthorPool(authors, exhausted)` frozen dataclass. Because excluded authors are
   skipped **at the source during paging**, an already-seen author costs **no** Tavily
   search and **no** Haiku call, and never re-enters `attempted_ids`. **Superseded:** there
-  is no longer a separate `_filter_excluded` step in `find_professors` (the helper still
-  exists but is no longer on the discovery path), and the pool is **no longer** sized up
-  by `len(exclude_ids)` — paging skips excluded authors instead of over-fetching then
-  discarding them. `target_pool = count * OVERFETCH_MULTIPLIER` (`OVERFETCH_MULTIPLIER`
+  is no separate exclusion helper in `find_professors` — exclusion lives entirely inside
+  `_list_authors`, which drops excluded IDs as it pages — and the pool is **no longer**
+  sized up by `len(exclude_ids)`: paging skips excluded authors instead of over-fetching
+  then discarding them. `target_pool = count * OVERFETCH_MULTIPLIER` (`OVERFETCH_MULTIPLIER`
   stays **3**).
 - **This is how a pass makes progress even when the exclude set outgrows the first page.**
   The old single-page fetch could return a page that was *entirely* excluded and surface

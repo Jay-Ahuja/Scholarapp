@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from scholarapp import usage as usage_tracker
 from scholarapp.usage import (
     PRICING,
+    UNPRICED_MARKER,
     CallRecord,
     UsageTracker,
     record,
@@ -78,7 +79,55 @@ def test_unknown_model_zero_cost():
         cache_read_input_tokens=0,
         output_tokens=1000,
     )
+    # cost_usd is still 0.0 (we have no rate), but the record reports itself as
+    # NOT priced so callers can flag the hidden spend instead of showing $0.00.
     assert r.cost_usd == 0.0
+    assert r.is_priced is False
+
+
+def test_known_model_is_priced():
+    r = CallRecord(
+        label="x",
+        model="claude-haiku-4-5",
+        input_tokens=1000,
+        cache_creation_input_tokens=0,
+        cache_read_input_tokens=0,
+        output_tokens=100,
+    )
+    assert r.is_priced is True
+
+
+def test_summarize_flags_unpriced_model_instead_of_zero():
+    tracker = UsageTracker()
+    # One recognized-model call and one unknown-model call.
+    tracker.record(
+        "parse_resume", "claude-sonnet-4-6", _u(input_tokens=1000, output_tokens=500)
+    )
+    tracker.record(
+        "mystery_call", "claude-bogus-9-9", _u(input_tokens=10000, output_tokens=1000)
+    )
+
+    out = summarize(tracker)
+
+    # The unknown model is flagged as unpriced, NOT shown as $0.00.
+    assert UNPRICED_MARKER in out
+    assert "mystery_call" in out
+    # The recognized model's cost is unchanged: 1000*$3/M + 500*$15/M = $0.0105.
+    assert "$0.0105" in out
+    # No misleading zero-dollar figure printed for the unpriced call.
+    assert "$0.0000" not in out
+
+
+def test_summarize_no_unpriced_marker_for_all_known_models():
+    tracker = UsageTracker()
+    tracker.record(
+        "extract_email", "claude-haiku-4-5", _u(input_tokens=2000, output_tokens=200)
+    )
+    out = summarize(tracker)
+    # All-known summaries must not mention the unpriced marker at all.
+    assert UNPRICED_MARKER not in out
+    # 2000*$1/M + 200*$5/M = $0.003 → total reflects the priced cost unchanged.
+    assert "$0.0030" in out
 
 
 def test_record_appends_to_current_tracker():

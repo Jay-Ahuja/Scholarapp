@@ -74,6 +74,30 @@ logging.basicConfig(
     stream=sys.stderr,
 )
 
+
+def _silence_windows_proactor_shutdown_noise() -> None:
+    """Avoid the spurious "Event loop is closed" traceback on a clean Windows run.
+
+    On Windows the default asyncio loop is the proactor loop. When `asyncio.run(...)`
+    closes the loop, httpx's connection-pool teardown can fire transport `__del__`
+    callbacks against the already-closed proactor loop, printing a RuntimeError
+    traceback to stderr AFTER results are shown — pure shutdown noise, not a real
+    error. Selecting the selector event-loop policy sidesteps that teardown race.
+
+    Guarded to Windows; a no-op on every other platform. The selector loop runs the
+    same coroutines with the same semaphore-bounded concurrency and issues the same
+    network requests — only the loop's I/O backend differs, so discovery/matching/
+    drafting behavior is unchanged.
+    """
+    if sys.platform != "win32":
+        return
+    policy = getattr(asyncio, "WindowsSelectorEventLoopPolicy", None)
+    if policy is not None:
+        asyncio.set_event_loop_policy(policy())
+
+
+_silence_windows_proactor_shutdown_noise()
+
 app = typer.Typer(
     name="scholar",
     help="Draft personalized cold emails to professors.",

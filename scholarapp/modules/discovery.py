@@ -597,22 +597,6 @@ async def _list_authors(
     return _AuthorPool(authors=collected[:target_count], exhausted=exhausted)
 
 
-def _filter_excluded(authors: list[dict], exclude_ids: set[str]) -> list[dict]:
-    """Drop authors whose short OpenAlex ID is in `exclude_ids`.
-
-    Applied BEFORE enrichment so excluded authors cost no Tavily/Haiku. The key is
-    the same short form as `ProfessorCandidate.openalex_id` and `_short_id` output.
-    """
-    if not exclude_ids:
-        return authors
-    kept: list[dict] = []
-    for author in authors:
-        if _short_id(author.get("id") or "") in exclude_ids:
-            continue
-        kept.append(author)
-    return kept
-
-
 async def _fetch_recent_works(http: httpx.AsyncClient, author_id: str) -> list[dict]:
     short = _short_id(author_id)
     response = await _request_with_retry(

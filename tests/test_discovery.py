@@ -635,20 +635,6 @@ def test_llm_pick_topics_includes_user_interests_in_prompt():
 # ---------------------------------------------------------------------------
 
 
-def test_filter_excluded_drops_by_short_id():
-    authors = [_author(0), _author(1), _author(2)]  # A0, A1, A2
-    kept = discovery._filter_excluded(authors, {"A1"})
-    assert [a["id"] for a in kept] == [
-        "https://openalex.org/A0",
-        "https://openalex.org/A2",
-    ]
-
-
-def test_filter_excluded_empty_set_is_passthrough():
-    authors = [_author(0), _author(1)]
-    assert discovery._filter_excluded(authors, set()) is authors
-
-
 def test_find_professors_excludes_ids_before_enrichment(monkeypatch, mock_discovery_env):
     """Excluded authors never trigger a paid Tavily search / Claude extraction."""
     extract_calls: list[str] = []
