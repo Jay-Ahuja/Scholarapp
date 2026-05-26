@@ -188,6 +188,90 @@ def test_usage_table_no_unpriced_marker_for_known_models(capture):
 
 
 # ---------------------------------------------------------------------------
+# cost_estimate_panel
+# ---------------------------------------------------------------------------
+
+
+def _estimate(**kw) -> SimpleNamespace:
+    stages = kw.get(
+        "stages",
+        [
+            SimpleNamespace(stage="discovery", cost_usd=0.0100),
+            SimpleNamespace(stage="matching", cost_usd=0.0250),
+            SimpleNamespace(stage="drafting", cost_usd=0.1500),
+        ],
+    )
+    return SimpleNamespace(
+        count=kw.get("count", 3),
+        total_usd=kw.get("total_usd", 0.1850),
+        stages=stages,
+        basis=kw.get("basis", "historical"),
+        sample_size=kw.get("sample_size", 5),
+    )
+
+
+def test_cost_estimate_panel_renders_stages_total_and_count(capture):
+    ui.cost_estimate_panel(_estimate())
+    out = capture.export_text()
+    # Each stage appears in pipeline order with its cost.
+    assert "discovery" in out
+    assert "matching" in out
+    assert "drafting" in out
+    assert "$0.0100" in out
+    assert "$0.0250" in out
+    assert "$0.1500" in out
+    # Total is surfaced.
+    assert "Total" in out
+    assert "$0.1850" in out
+    # Count of professors is surfaced.
+    assert "3" in out
+
+
+def test_cost_estimate_panel_historical_mentions_sample_size(capture):
+    ui.cost_estimate_panel(_estimate(basis="historical", sample_size=5))
+    out = capture.export_text()
+    assert "5" in out
+    assert "runs" in out
+    # Plural form for sample_size > 1.
+    assert "run" in out
+
+
+def test_cost_estimate_panel_historical_singular_run(capture):
+    ui.cost_estimate_panel(_estimate(basis="historical", sample_size=1))
+    out = capture.export_text()
+    assert "last 1 run" in out
+
+
+def test_cost_estimate_panel_static_reads_as_rough(capture):
+    ui.cost_estimate_panel(_estimate(basis="static", sample_size=0))
+    out = capture.export_text()
+    assert "static" in out.lower()
+    # A static estimate should NOT claim to be based on past runs.
+    assert "based on the last" not in out
+
+
+def test_cost_estimate_panel_preserves_stage_order(capture):
+    ui.cost_estimate_panel(_estimate())
+    out = capture.export_text()
+    assert out.index("discovery") < out.index("matching") < out.index("drafting")
+
+
+# ---------------------------------------------------------------------------
+# budget_stop_notice
+# ---------------------------------------------------------------------------
+
+
+def test_budget_stop_notice_names_budget_and_spent(capture):
+    ui.budget_stop_notice(budget_usd=2.00, spent_usd=1.9876)
+    out = capture.export_text()
+    assert "warning" in out.lower()
+    assert "budget" in out.lower()
+    # Both the spent amount and the budget ceiling are named.
+    assert "$1.9876" in out
+    assert "$2.0000" in out
+
+
+# ---------------------------------------------------------------------------
 # professors_table
 # ---------------------------------------------------------------------------
 

@@ -24,7 +24,6 @@ from typing import Any
 
 from rich.console import Console
 from rich.panel import Panel
-from rich.rule import Rule
 from rich.table import Table
 
 from scholarapp.usage import UNPRICED_MARKER
@@ -299,6 +298,65 @@ def render_usage_table(tracker: Any) -> None:
     )
     if breakdown:
         console.print(f"  {breakdown}")
+
+
+def cost_estimate_panel(estimate: Any) -> None:
+    """Render the pre-run cost estimate: per-stage breakdown, total, and basis.
+
+    Mirrors render_usage_table()'s idiom — a titled, left-justified table with a
+    section divider before the total — but this runs *before* the pipeline so it
+    advertises projected (not recorded) spend. The basis line tells the user how
+    much to trust the number: a "historical" estimate averages real past runs
+    (sample_size of them), while a "static" one is a rough built-in guess.
+    """
+    table = Table(
+        title="[bold]Estimated cost[/bold]",
+        title_justify="left",
+        show_header=True,
+        header_style="bold",
+    )
+    table.add_column("Stage")
+    table.add_column("Est. cost", justify="right")
+
+    # Stages arrive in pipeline order (discovery, matching, drafting); preserve it.
+    for s in estimate.stages:
+        table.add_row(s.stage, f"${s.cost_usd:.4f}")
+
+    table.add_section()
+    table.add_row(
+        "[bold]Total[/bold]",
+        f"[bold]${estimate.total_usd:.4f}[/bold]",
+    )
+
+    console.print(table)
+
+    # Surface the basis so the headline number is read with the right confidence.
+    if estimate.basis == "historical":
+        runs_word = "run" if estimate.sample_size == 1 else "runs"
+        basis_text = (
+            f"  [dim]for {estimate.count} professor(s), "
+            f"based on the last {estimate.sample_size} {runs_word}[/dim]"
+        )
+    else:
+        basis_text = (
+            f"  [dim]for {estimate.count} professor(s), "
+            f"rough static estimate (no past runs to average)[/dim]"
+        )
+    console.print(basis_text)
+
+
+def budget_stop_notice(budget_usd: float, spent_usd: float) -> None:
+    """Warn-style line shown with the end-of-run usage section when a run
+    stopped because the budget ceiling was reached.
+
+    Reuses the yellow `warning:` prefix from warn() for visual consistency, but
+    names both the configured budget and the amount actually spent so the user
+    can see how close the two are.
+    """
+    console.print(
+        f"[yellow]warning:[/yellow] run stopped — budget reached: "
+        f"spent [bold]${spent_usd:.4f}[/bold] of [bold]${budget_usd:.4f}[/bold] budget"
+    )
 
 
 def delivery_report(report: Any) -> None:
