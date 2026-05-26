@@ -102,6 +102,31 @@ class SyncReport(BaseModel):
 
 _SLUG_NONALNUM = re.compile(r"[^a-z0-9-]+")
 
+# Draft files routinely contain non-ASCII characters Claude emits (the Unicode
+# hyphen U+2010, en/em dashes, curly quotes). Pin UTF-8 on every text read/write
+# so the round-trip is stable regardless of the platform's locale code page
+# (cp1252 on Windows can't encode these and raises UnicodeEncodeError).
+_FILE_ENCODING = "utf-8"
+
+
+def _read_text(path: Path) -> str:
+    """Read a draft text file as UTF-8 with universal-newline translation.
+
+    Universal newlines (the default) collapse any \\r\\n on disk back to \\n so
+    parsing and write->read equality stay platform-independent.
+    """
+    return path.read_text(encoding=_FILE_ENCODING)
+
+
+def _write_text(path: Path, content: str) -> None:
+    """Write a draft text file as UTF-8 without newline translation.
+
+    `newline=""` disables the platform line-ending translation so the bytes on
+    disk keep the \\n that callers render; this keeps the write->read round-trip
+    and sync's conflict-detection snapshot byte-stable on Windows.
+    """
+    path.write_text(content, encoding=_FILE_ENCODING, newline="")
+
 
 def _to_naive_utc(dt: datetime) -> datetime:
     """Normalize a datetime to naive UTC for comparison.
@@ -171,7 +196,7 @@ def _split_subject_and_body(rest: str) -> tuple[str, str]:
 
 def parse_draft_file(path: Path) -> ParsedDraft:
     """Read a draft markdown file and return its typed contents."""
-    text = path.read_text()
+    text = _read_text(path)
     fm, rest = _split_frontmatter(text)
     subject, body = _split_subject_and_body(rest)
 
@@ -235,13 +260,13 @@ def write_status_in_file(path: Path, new_status: str) -> None:
     Preserves every other byte of the file.
     """
     parsed = parse_draft_file(path)
-    text = path.read_text()
+    text = _read_text(path)
     fm, rest = _split_frontmatter(text)
     fm["status"] = new_status
     new_yaml = yaml.safe_dump(
         fm, sort_keys=False, allow_unicode=True, default_flow_style=False
     )
-    path.write_text(f"---\n{new_yaml}---\n{rest}")
+    _write_text(path, f"---\n{new_yaml}---\n{rest}")
 
 
 # ---------------------------------------------------------------------------
@@ -311,7 +336,7 @@ def write_drafts_to_disk(run_id: str) -> Path:
                 subject=draft.subject,
                 body=draft.body,
             )
-            file_path.write_text(content)
+            _write_text(file_path, content)
 
     return drafts_dir
 

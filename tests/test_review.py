@@ -358,3 +358,92 @@ def test_write_drafts_unknown_run_raises(isolated_db):
 def test_sync_drafts_missing_directory_raises(isolated_db):
     with pytest.raises(NotFoundError):
         review.sync_drafts_from_disk("bogus-run-id")
+
+
+# ---------------------------------------------------------------------------
+# UTF-8 encoding: non-ASCII characters survive the write -> read -> sync cycle
+# ---------------------------------------------------------------------------
+
+
+# Characters Claude routinely emits that cp1252 (the Windows locale code page)
+# can encode only partially or not at all. U+2010 is the canonical offender —
+# Path.write_text() with no encoding= raises UnicodeEncodeError on it on Windows.
+_NON_ASCII_SUBJECT = "Question on partial‐volume handling — a follow‐up"
+_NON_ASCII_BODY = (
+    "Dear Prof. Friston,\n\n"
+    "I’d love to discuss your “probabilistic” segmentation work "
+    "— it’s relevant to my interests in non‐invasive imaging.\n\n"
+    "Best,\nJay"
+)
+
+
+def test_non_ascii_survives_write_read_sync_cycle(isolated_db):
+    """A draft carrying U+2010 (Unicode hyphen) + dashes/curly quotes must
+    round-trip through write -> read (parse) -> sync unchanged. On Windows this
+    used to crash with UnicodeEncodeError at the write step (cp1252 default)."""
+    run_id, _, draft_id = _seed_one_draft(
+        subject=_NON_ASCII_SUBJECT, body=_NON_ASCII_BODY
+    )
+
+    path = review.write_drafts_to_disk(run_id)
+    file_path = next(path.glob("*.md"))
+
+    # Read side: parse must recover the exact non-ASCII characters.
+    parsed = review.parse_draft_file(file_path)
+    assert parsed.subject == _NON_ASCII_SUBJECT
+    assert "‐" in parsed.subject
+    assert parsed.body == _NON_ASCII_BODY
+
+    # Full sync: nothing changed, no errors — the round-trip is byte-stable.
+    report = review.sync_drafts_from_disk(run_id)
+    assert report.errors == 0
+    assert report.updated == 0
+    assert report.unchanged == 1
+    assert report.status_changed == 0
+
+    # DB still holds the original non-ASCII text exactly.
+    with get_session() as s:
+        d = repo.get_draft(s, draft_id)
+        assert d.subject == _NON_ASCII_SUBJECT
+        assert d.body == _NON_ASCII_BODY
+
+
+def test_draft_files_are_written_as_utf8_bytes(isolated_db):
+    """Guard against silent reliance on the platform default encoding.
+
+    Tests run on Linux/utf-8 by default, so a missing encoding= would still pass
+    a string round-trip there. Assert the bytes on disk are valid UTF-8 (and NOT
+    decodable as the cp1252 mojibake a locale-default write would produce) so a
+    regression that drops encoding="utf-8" is caught on every platform."""
+    run_id, _, _ = _seed_one_draft(subject=_NON_ASCII_SUBJECT, body=_NON_ASCII_BODY)
+
+    path = review.write_drafts_to_disk(run_id)
+    file_path = next(path.glob("*.md"))
+
+    raw = file_path.read_bytes()
+    # The bytes decode cleanly as UTF-8 and contain the U+2010 code point's
+    # canonical UTF-8 encoding (E2 80 90).
+    text = raw.decode("utf-8")
+    assert "‐" in text
+    assert b"\xe2\x80\x90" in raw
+
+    # write_text(newline="") must not have translated \n -> \r\n, so no stray
+    # carriage returns leak into the round-trip / conflict-detection snapshot.
+    assert b"\r\n" not in raw
+
+
+def test_write_status_in_file_preserves_non_ascii(isolated_db):
+    """write_status_in_file rewrites only the status field; the UTF-8 body must
+    survive its read + write (it uses the same encoding path)."""
+    run_id, _, draft_id = _seed_one_draft(
+        subject=_NON_ASCII_SUBJECT, body=_NON_ASCII_BODY
+    )
+    path = review.write_drafts_to_disk(run_id)
+    file_path = next(path.glob("*.md"))
+
+    review.write_status_in_file(file_path, "approved")
+
+    parsed = review.parse_draft_file(file_path)
+    assert parsed.status == "approved"
+    assert parsed.subject == _NON_ASCII_SUBJECT
+    assert parsed.body == _NON_ASCII_BODY
