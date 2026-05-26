@@ -26,6 +26,7 @@ import json
 import logging
 from datetime import UTC, datetime
 from email.message import EmailMessage
+from pathlib import Path
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -137,11 +138,21 @@ def _gmail_service(creds: Credentials):
 # ---------------------------------------------------------------------------
 
 
-def _build_mime(draft: Draft, to_addr: str, from_addr: str) -> str:
+def _build_mime(
+    draft: Draft,
+    to_addr: str,
+    from_addr: str,
+    resume_bytes: bytes | None = None,
+) -> str:
     """Build an RFC 822 MIME message and return its base64url-encoded raw string.
 
-    Plain text only — no HTML, no attachments. The draft.body is multi-paragraph
-    plain text; Gmail will render line breaks as the user wrote them.
+    The draft.body is multi-paragraph plain text; Gmail renders line breaks as the
+    user wrote them.
+
+    When `resume_bytes` is None (the default, and the only behavior when
+    send_attach_resume is off) the message is plain text — byte-identical to before.
+    When `resume_bytes` is provided the message becomes multipart: the plain-text
+    body plus a single application/pdf attachment named "resume.pdf".
 
     Note: the spec says `_build_mime(draft, from_addr)`. We need `to_addr` too
     (Draft has professor_id but not the email itself), so the signature has an
@@ -153,6 +164,13 @@ def _build_mime(draft: Draft, to_addr: str, from_addr: str) -> str:
     msg["From"] = from_addr
     msg["Subject"] = draft.subject
     msg.set_content(draft.body)
+    if resume_bytes is not None:
+        msg.add_attachment(
+            resume_bytes,
+            maintype="application",
+            subtype="pdf",
+            filename="resume.pdf",
+        )
     raw_bytes = msg.as_bytes()
     return base64.urlsafe_b64encode(raw_bytes).decode("ascii")
 
@@ -194,8 +212,10 @@ def send_approved(run_id: str) -> DeliveryReport:
     settings = load_settings()
 
     with get_session() as session:
-        if repo.get_run(session, run_id) is None:
+        run = repo.get_run(session, run_id)
+        if run is None:
             raise NotFoundError(f"No run with id {run_id}")
+        run_resume_path = run.resume_path
         drafts = repo.list_drafts_for_run_by_status(
             session, run_id, DraftStatus.APPROVED
         )
@@ -247,6 +267,19 @@ def send_approved(run_id: str) -> DeliveryReport:
             p.id: p for p in repo.list_professors_for_run(session, run_id)
         }
 
+    # Resume attachment (default off). Read the PDF ONCE per run from
+    # Run.resume_path. A missing/unreadable file is NOT fatal: we record the
+    # failure here and turn it into a per-draft SendLog error inside the loop,
+    # so the batch continues. When the toggle is off, resume_bytes stays None and
+    # the message is byte-identical to the plain-text path.
+    resume_bytes: bytes | None = None
+    resume_error: str | None = None
+    if settings.send_attach_resume:
+        try:
+            resume_bytes = Path(run_resume_path).read_bytes()
+        except OSError as e:
+            resume_error = f"could not read resume {run_resume_path!r}: {e}"
+
     remaining_budget = settings.send_daily_cap - already_sent_today
 
     for draft in drafts:
@@ -272,8 +305,27 @@ def send_approved(run_id: str) -> DeliveryReport:
             )
             continue
 
+        # Attachment requested but the resume could not be read: log a per-draft
+        # error and continue — one unreadable resume must not kill the batch.
+        if resume_error is not None:
+            with get_session() as session:
+                repo.add_send_log(
+                    session,
+                    draft_id=draft.id,
+                    outcome=SendOutcome.ERROR,
+                    error=resume_error,
+                )
+            report.errors += 1
+            report.error_messages.append(f"draft {draft.id}: {resume_error}")
+            continue
+
         try:
-            raw = _build_mime(draft, to_addr=prof.email, from_addr=from_addr)
+            raw = _build_mime(
+                draft,
+                to_addr=prof.email,
+                from_addr=from_addr,
+                resume_bytes=resume_bytes,
+            )
             result = service.users().messages().send(
                 userId="me", body={"raw": raw}
             ).execute()

@@ -282,6 +282,238 @@ def test_daily_cap_raises_before_any_gmail_call(isolated_db, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Resume attachment (config.toml [send].attach_resume), real-send path
+# ---------------------------------------------------------------------------
+
+
+def _write_config_attach(tmp_path, *, attach: bool) -> None:
+    """Write a config.toml under DATA_DIR with the [send].attach_resume toggle."""
+    (tmp_path / "config.toml").write_text(
+        '[app]\nversion = "0.1.0"\n\n'
+        f"[send]\nattach_resume = {'true' if attach else 'false'}\n",
+        encoding="utf-8",
+    )
+
+
+def _captured_raw_to_msg(raw: str):
+    """Decode a base64url Gmail `raw` blob into an email.message.Message."""
+    import base64
+    import email.policy
+    from email import message_from_bytes
+
+    decoded = base64.urlsafe_b64decode(raw.encode("ascii"))
+    return message_from_bytes(decoded, policy=email.policy.default)
+
+
+def _fake_service_capturing_raw(captured: list[str]):
+    """Gmail mock that records each send()'s `raw` body into `captured`."""
+    service = MagicMock()
+    service.users().getProfile().execute.return_value = {
+        "emailAddress": "me@example.com",
+    }
+
+    counter = {"n": 0}
+
+    def _send(*_a, **kw):
+        body = kw.get("body") or {}
+        captured.append(body.get("raw"))
+        sender = MagicMock()
+
+        def _execute(*_a2, **_kw2):
+            counter["n"] += 1
+            return {"id": f"msg-{counter['n']}"}
+
+        sender.execute.side_effect = _execute
+        return sender
+
+    service.users().messages().send.side_effect = _send
+    return service
+
+
+def test_default_off_sends_plain_text_no_attachment(isolated_db, monkeypatch):
+    """No config.toml => attach_resume defaults off => message is plain text,
+    not multipart, and carries no attachment.
+    """
+    monkeypatch.setenv("SEND_ENABLED", "true")
+    monkeypatch.setattr(delivery, "_load_credentials", lambda: MagicMock())
+
+    captured: list[str] = []
+    monkeypatch.setattr(
+        delivery, "_gmail_service", lambda creds: _fake_service_capturing_raw(captured)
+    )
+
+    run_id, _, _ = _seed_n_approved_drafts(1)
+    report = delivery.send_approved(run_id)
+
+    assert report.sent == 1
+    assert report.errors == 0
+    assert len(captured) == 1
+    msg = _captured_raw_to_msg(captured[0])
+    assert not msg.is_multipart()
+    assert list(msg.iter_attachments()) == []
+
+
+def test_attach_on_sends_multipart_with_resume_pdf(isolated_db, monkeypatch):
+    """With attach_resume=true and a readable resume PDF, the sent MIME is
+    multipart and carries a PDF part named resume.pdf.
+    """
+    monkeypatch.setenv("SEND_ENABLED", "true")
+    _write_config_attach(isolated_db, attach=True)
+    monkeypatch.setattr(delivery, "_load_credentials", lambda: MagicMock())
+
+    # A real resume file on disk for the run.
+    resume_file = isolated_db / "resume.pdf"
+    resume_file.write_bytes(b"%PDF-1.4 fake pdf bytes")
+
+    captured: list[str] = []
+    monkeypatch.setattr(
+        delivery, "_gmail_service", lambda creds: _fake_service_capturing_raw(captured)
+    )
+
+    with get_session() as session:
+        run = repo.create_run(
+            session, field="x", goal="g", considerations="", count=1,
+            resume_path=str(resume_file), template_text="t",
+        )
+        repo.update_run_status(session, run.id, RunStatus.REVIEW)
+        prof = repo.add_professor(
+            session, run_id=run.id, name="P", institution="U",
+            email="p@u.edu", openalex_id="A0",
+        )
+        repo.add_draft(
+            session, run_id=run.id, professor_id=prof.id,
+            subject="s", body="hello", status=DraftStatus.APPROVED,
+        )
+        run_id = run.id
+
+    report = delivery.send_approved(run_id)
+
+    assert report.sent == 1
+    assert report.errors == 0
+    msg = _captured_raw_to_msg(captured[0])
+    assert msg.is_multipart()
+    attachments = list(msg.iter_attachments())
+    assert len(attachments) == 1
+    att = attachments[0]
+    assert att.get_filename() == "resume.pdf"
+    assert att.get_content_type() == "application/pdf"
+    assert att.get_payload(decode=True) == b"%PDF-1.4 fake pdf bytes"
+
+
+def test_attach_on_missing_resume_logs_per_draft_error_and_continues(
+    isolated_db, monkeypatch
+):
+    """attach_resume=true but Run.resume_path is unreadable: every draft gets a
+    per-draft SendLog error, the batch does not crash, and no email is sent.
+    """
+    monkeypatch.setenv("SEND_ENABLED", "true")
+    _write_config_attach(isolated_db, attach=True)
+    monkeypatch.setattr(delivery, "_load_credentials", lambda: MagicMock())
+
+    fake_service = _make_fake_gmail_service()
+    monkeypatch.setattr(delivery, "_gmail_service", lambda creds: fake_service)
+
+    # resume_path points at a file that does not exist.
+    missing = isolated_db / "nope" / "resume.pdf"
+    with get_session() as session:
+        run = repo.create_run(
+            session, field="x", goal="g", considerations="", count=2,
+            resume_path=str(missing), template_text="t",
+        )
+        repo.update_run_status(session, run.id, RunStatus.REVIEW)
+        for i in range(2):
+            prof = repo.add_professor(
+                session, run_id=run.id, name=f"P{i}", institution="U",
+                email=f"p{i}@u.edu", openalex_id=f"A{i}",
+            )
+            repo.add_draft(
+                session, run_id=run.id, professor_id=prof.id,
+                subject=f"s{i}", body="b", status=DraftStatus.APPROVED,
+            )
+        run_id = run.id
+
+    report = delivery.send_approved(run_id)
+
+    assert report.attempted == 2
+    assert report.sent == 0
+    assert report.errors == 2
+    # Gmail send was never called — the resume read failed before any send.
+    assert fake_service.users().messages().send().execute.call_count == 0
+    with get_session() as s:
+        err_logs = list(
+            s.scalars(select(SendLog).where(SendLog.outcome == SendOutcome.ERROR))
+        )
+        assert len(err_logs) == 2
+        assert all("resume" in (log.error or "") for log in err_logs)
+
+
+def test_attach_on_one_missing_resume_does_not_stop_others(isolated_db, monkeypatch):
+    """A second run with a readable resume still sends — proving the per-draft
+    error path is local to drafts and the batch continues past errors.
+    """
+    monkeypatch.setenv("SEND_ENABLED", "true")
+    _write_config_attach(isolated_db, attach=True)
+    monkeypatch.setattr(delivery, "_load_credentials", lambda: MagicMock())
+
+    resume_file = isolated_db / "resume.pdf"
+    resume_file.write_bytes(b"%PDF-1.4 ok")
+    captured: list[str] = []
+    monkeypatch.setattr(
+        delivery, "_gmail_service", lambda creds: _fake_service_capturing_raw(captured)
+    )
+
+    # Three approved drafts on a run whose resume exists -> all three send.
+    with get_session() as session:
+        run = repo.create_run(
+            session, field="x", goal="g", considerations="", count=3,
+            resume_path=str(resume_file), template_text="t",
+        )
+        repo.update_run_status(session, run.id, RunStatus.REVIEW)
+        for i in range(3):
+            prof = repo.add_professor(
+                session, run_id=run.id, name=f"P{i}", institution="U",
+                email=f"p{i}@u.edu", openalex_id=f"A{i}",
+            )
+            repo.add_draft(
+                session, run_id=run.id, professor_id=prof.id,
+                subject=f"s{i}", body="b", status=DraftStatus.APPROVED,
+            )
+        run_id = run.id
+
+    report = delivery.send_approved(run_id)
+    assert report.sent == 3
+    assert report.errors == 0
+    for raw in captured:
+        msg = _captured_raw_to_msg(raw)
+        assert msg.is_multipart()
+        assert [a.get_filename() for a in msg.iter_attachments()] == ["resume.pdf"]
+
+
+def test_attach_on_does_not_bypass_send_disabled_gate(isolated_db, monkeypatch):
+    """attach_resume=true must NOT touch the SEND_ENABLED gate: with
+    SEND_ENABLED=false, SendingDisabled is still raised and no Gmail is reached.
+    """
+    monkeypatch.setenv("SEND_ENABLED", "false")
+    _write_config_attach(isolated_db, attach=True)
+
+    # If the gate were bypassed these would be consulted; they must not be.
+    creds_factory = MagicMock()
+    service_factory = MagicMock()
+    monkeypatch.setattr(delivery, "_load_credentials", creds_factory)
+    monkeypatch.setattr(delivery, "_gmail_service", service_factory)
+
+    run_id, _, draft_ids = _seed_n_approved_drafts(2)
+    with pytest.raises(SendingDisabled, match="2 draft"):
+        delivery.send_approved(run_id)
+
+    creds_factory.assert_not_called()
+    service_factory.assert_not_called()
+    with get_session() as s:
+        for did in draft_ids:
+            assert repo.get_draft(s, did).status == DraftStatus.APPROVED
+
+
 def test_build_mime_round_trip(isolated_db):
     """Verify the MIME message is parseable + has the right headers/body."""
     import base64
