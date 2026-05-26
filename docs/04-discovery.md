@@ -16,25 +16,35 @@ async def find_professors(
 
 `find_professors` returns a `DiscoveryResult` — a frozen `@dataclass` (defined in
 [scholarapp/modules/discovery.py](../scholarapp/modules/discovery.py), alongside
-`ProfessorCandidate`; it's a plain dataclass, not Pydantic) that bundles two things:
+`ProfessorCandidate`; it's a plain dataclass, not Pydantic) that bundles three things:
 
 ```python
 @dataclass(frozen=True)
 class DiscoveryResult:
     professors: list[ProfessorCandidate]  # email-validated survivors, capped at `count`
     attempted_ids: set[str]               # short OpenAlex IDs of EVERY author enriched this pass
+    exhausted: bool                       # True ONLY when OpenAlex ran out of NEW authors
 ```
 
 - **`professors`** — the email-validated survivors, capped at `count`. This is the same
   list the function used to return directly; nothing about it changed.
 - **`attempted_ids`** — the short-form OpenAlex author IDs (same form as
   `ProfessorCandidate.openalex_id`) of **every** author the pass ran through enrichment:
-  the full pulled → exclude-filtered → deduped pool that each incurred a paid Tavily
-  search + Haiku extraction. It includes both the survivors **and** the authors dropped
-  for lacking an academic email. The CLI top-up loop excludes this whole set — not just
-  the survivors — so later passes never re-pull and re-pay for the same top-cited authors
-  a prior pass already enriched and discarded. See
+  the full paged → deduped pool that each incurred a paid Tavily search + Haiku
+  extraction. It includes both the survivors **and** the authors dropped for lacking an
+  academic email. The CLI top-up loop excludes this whole set — not just the survivors —
+  so later passes never re-pull and re-pay for the same top-cited authors a prior pass
+  already enriched and discarded. See
   [The `exclude_ids` contract](#the-exclude_ids-contract-how-passes-make-progress) below.
+- **`exhausted`** — `True` **only** when OpenAlex paging genuinely ran out of NEW
+  (non-excluded) authors for the resolved topics before the over-fetch pool filled — i.e.
+  the field has no more candidates to hand back. Reaching the bounded page cap
+  (`_MAX_AUTHOR_PAGES`) is **not** exhaustion (`exhausted=False`), and `count <= 0` returns
+  `exhausted=False` (nothing was paged). This is the signal that **replaced** the old
+  "empty `attempted_ids` ⇒ field exhausted" heuristic — the CLI top-up loop now breaks on
+  `exhausted`, not on an empty batch. See
+  [The `exclude_ids` contract](#the-exclude_ids-contract-how-passes-make-progress) and
+  [Termination conditions](#termination-conditions) below.
 
 `user_interests` is accepted but not yet used — actual relevance ranking happens in
 Step 5 (matching). Today it's a forward-compatible knob for future "narrow the author
@@ -66,15 +76,12 @@ field (str) ──┐
     ┌─────────────────────┐
     │ GET /authors        │  filter=topics.id:T10077|T11601,
     │  &sort=cited_by     │         last_known_institutions.type:education,
-    │                     │         works_count:>10
-    └─────────┬───────────┘
-              │  (count + len(exclude_ids)) × 3 authors (over-fetch)
-              ▼
-    ┌─────────────────────┐
-    │ Filter excluded     │  _filter_excluded — drop already-seen
-    │ (exclude_ids)       │  OpenAlex IDs BEFORE any paid lookup
-    └─────────┬───────────┘
-              │  only NEW candidates remain
+    │  &cursor=* (paged)  │         works_count:>10
+    └─────────┬───────────┘   _list_authors: cursor-page (per_page=_AUTHORS_PER_PAGE),
+              │               SKIP exclude_ids per page, follow meta.next_cursor.
+              │               Stop when pool full / OpenAlex out / _MAX_AUTHOR_PAGES.
+              │               Returns _AuthorPool(authors, exhausted).
+              │  count × 3 NEW authors (over-fetch pool; excluded skipped at source)
               ▼
     ┌─────────────────────┐
     │ Dedup within run    │  _dedup_authors — collapse duplicate
@@ -103,7 +110,8 @@ field (str) ──┐
     (captured before the gather — survivors AND email-less discards).
               ▼
     Drop candidates where email fails the academic-TLD allowlist.
-    Take the first `count` survivors → DiscoveryResult(professors, attempted_ids).
+    Take the first `count` survivors → DiscoveryResult(professors, attempted_ids, exhausted).
+    `exhausted` is carried up from the _AuthorPool: True only if OpenAlex paging ran dry.
 ```
 
 `find_professors` is one *pass*. Its `professors` list holds up to `count` survivors; it
@@ -112,10 +120,12 @@ in the CLI's top-up loop, which calls `find_professors` repeatedly with a growin
 `exclude_ids` until the requested number of *draftable* professors is reached or the
 field is exhausted. See the next section.
 
-Note the asymmetry between the two `DiscoveryResult` fields: `professors` is *capped* at
+Note the asymmetry between the `DiscoveryResult` fields: `professors` is *capped* at
 `count` (the survivor loop breaks once it has `count`), but `attempted_ids` reflects the
 **entire** enriched pool — it's captured before the enrichment fan-out, so it counts
 every author that was paid for even though only `count` survivors are returned.
+`exhausted` is orthogonal to both: it reports whether OpenAlex paging ran dry (a property
+of the *upstream* author supply), independent of how many survivors enrichment produced.
 
 ## The count guarantee and the discovery top-up loop
 
@@ -175,10 +185,13 @@ Each pass is two persisted steps, factored into helpers so the initial pass and 
 top-up share code:
 
 - `_discover_and_persist(...)` → calls `find_professors(..., exclude_ids=...)`, writes
-  the new `Professor` + `Project` rows, and returns
-  `(candidates, new_professor_ids, attempted_ids)`. The third element forwards the
+  the new `Professor` + `Project` rows, and returns the 4-tuple
+  `(candidates, new_professor_ids, attempted_ids, exhausted)`. The third element forwards
   `DiscoveryResult.attempted_ids` straight through so the caller can grow `exclude_ids`
   by **every** author the pass paid to enrich — not just the survivors in `candidates`.
+  The fourth element forwards `DiscoveryResult.exhausted` so the top-up loop can tell
+  genuine field exhaustion (stop) apart from a pass that merely surfaced no survivors
+  (keep going).
 - `_match_and_persist(professor_ids=...)` → matches **only** the newly persisted
   professors (so a top-up never re-matches and re-pays for professors matched in an
   earlier pass), persisting their matched projects. When a top-up pass persists **no**
@@ -203,25 +216,46 @@ this:
   deeper ranks. Excluding the full attempted pool forces each pass onto fresh authors.
 - The growth happens after **both** the initial pass and **every** top-up pass, via
   `seen_openalex_ids.update(attempted_ids)` (initial) and
-  `seen_openalex_ids.update(topup_attempted_ids)` (each top-up). Crucially, the top-up
-  update runs **before** the field-exhaustion check — so a pass that paid to enrich
-  authors but produced **no** email-validated survivor still records its pool, and the
-  next pass won't re-pull it. That survivor-less pass is **not** exhaustion: it had a
-  non-empty `attempted_ids`, so it keeps the loop going (counted toward the empty-batch
-  streak). The field-exhaustion signal is the opposite — a pass that surfaces no *new*
-  authors at all, so its `attempted_ids` is **empty** (and the update above is a no-op).
-- `find_professors` drops excluded authors via `_filter_excluded` **BEFORE enrichment**,
-  so an already-seen author costs **no** Tavily search and **no** Haiku call — and, being
-  filtered out before enrichment, an excluded author never re-enters `attempted_ids`.
-- The OpenAlex fetch is sized up to make room for the ones it's about to drop:
-  `target_pool = (count + len(exclude_ids)) * OVERFETCH_MULTIPLIER`. Without the
-  `+ len(exclude_ids)` term, the excluded top-cited authors would eat into the pool and
-  a repeat pass could surface fewer than `count` *new* candidates. `OVERFETCH_MULTIPLIER`
-  stays **3**.
+  `seen_openalex_ids.update(topup_attempted_ids)` (each top-up). The top-up update runs
+  **before** the exhaustion check and matching — so a pass that paid to enrich authors
+  but produced **no** email-validated survivor still records its pool, and the next pass
+  won't re-pull it.
+- **How a pass skips already-seen authors (cursor paging).** `find_professors` no longer
+  fetches one fixed-size page and then filters it. Instead `_list_authors` **cursor-pages**
+  OpenAlex `/authors` (entrypoint `cursor=*`, following `meta.next_cursor`), skipping any
+  author whose short ID is in `exclude_ids` **as each page arrives**, accumulating only
+  NEW authors. It keeps paging until the over-fetch pool of `count * OVERFETCH_MULTIPLIER`
+  NEW authors is filled, OpenAlex hands back no further page, or the hard cap of
+  `_MAX_AUTHOR_PAGES` (10) pages of `_AUTHORS_PER_PAGE` (200) each is reached. It returns
+  an `_AuthorPool(authors, exhausted)` frozen dataclass. Because excluded authors are
+  skipped **at the source during paging**, an already-seen author costs **no** Tavily
+  search and **no** Haiku call, and never re-enters `attempted_ids`. **Superseded:** there
+  is no longer a separate `_filter_excluded` step in `find_professors` (the helper still
+  exists but is no longer on the discovery path), and the pool is **no longer** sized up
+  by `len(exclude_ids)` — paging skips excluded authors instead of over-fetching then
+  discarding them. `target_pool = count * OVERFETCH_MULTIPLIER` (`OVERFETCH_MULTIPLIER`
+  stays **3**).
+- **This is how a pass makes progress even when the exclude set outgrows the first page.**
+  The old single-page fetch could return a page that was *entirely* excluded and surface
+  zero new authors despite plenty of fresh candidates sitting one page deeper. Paging walks
+  past those exhausted ranks for free until it finds NEW authors or OpenAlex truly runs
+  out.
+- **The exhaustion signal — `_AuthorPool.exhausted` → `DiscoveryResult.exhausted`.**
+  `exhausted` is `True` **only** when OpenAlex paging ran out (no `next_cursor` / empty
+  page) **before** the pool filled — genuine field exhaustion for these topics. Hitting
+  the `_MAX_AUTHOR_PAGES` cap with the pool still unfilled leaves `exhausted=False` (deeper
+  authors may still exist; the bounded case is handled by the empty-batch streak / runaway
+  guard, not by an exhaustion stop). When a top-up pass surfaces no NEW author at all,
+  `find_professors` returns `professors=[], attempted_ids=set()` **with**
+  `exhausted=openalex_exhausted` — so an empty batch alone no longer means "stop"; only the
+  flag does. **Superseded:** this replaces the old heuristic where an empty `attempted_ids`
+  was *itself* taken as field exhaustion. That heuristic was wrong precisely because the
+  old single-page fetch could return an all-excluded page (empty batch) while the field
+  still had candidates deeper down.
 
-`exclude_ids=None` reproduces the pre-feature single-pass behavior exactly (empty set,
-no filtering, `target_pool = count * 3`), so callers that don't need top-up are
-unaffected.
+`exclude_ids=None` reproduces the pre-feature single-pass behavior closely (empty set, no
+skipping, `target_pool = count * 3`), so callers that don't need top-up are unaffected —
+though discovery now always pages (up to the cap) rather than fetching a single page.
 
 ### Termination conditions
 
@@ -230,36 +264,47 @@ stop short of `count` falls through to partial delivery (next section):
 
 1. **Target reached** — `have >= count`. The loop condition (`while have < count`) is
    false. The run proceeds to draft exactly `count`.
-2. **Field exhausted** — a top-up pass surfaces **no new authors at all**: its
-   `attempted_ids` is **empty** (nothing pulled, nothing paid for). Only this signals
-   genuine exhaustion — OpenAlex, after the exclude filter, had no fresh author left to
-   hand back — so the loop breaks (`if not topup_attempted_ids: break`). This is the
-   *genuine exhaustion* case and is **not** counted toward the empty-batch streak below.
-   Note the loop folds that pass's `attempted_ids` into `seen_openalex_ids` **before**
-   this check; when `attempted_ids` is empty the update is a harmless no-op.
+2. **Field exhausted** — discovery reports `exhausted=True`: OpenAlex paging genuinely ran
+   out of NEW (non-excluded) authors for the resolved topics. The loop breaks on
+   `topup_exhausted` (forwarded out of `_discover_and_persist` as the tuple's 4th element).
+   This is the *genuine exhaustion* case and is **not** counted toward the empty-batch
+   streak below.
 
-   A pass that **did** pull new authors but produced **no email-validated survivor**
-   (every author dropped at email validation) is **not** exhaustion: it spent money
-   exploring deeper ranks, so its `attempted_ids` is non-empty and the loop keeps going,
-   counting the pass toward the empty-batch streak below. The stop signal is "discovery
-   found nobody new," never "this pass had no survivors."
+   Two details matter for correctness:
+   - **The break fires AFTER matching, not before.** A pass that drains OpenAlex's last
+     authors can still return matchable survivors (the final page that fills the pool just
+     before OpenAlex runs dry). So the loop matches this pass's newly-persisted professors
+     and recomputes `have` **first**, then honors the `exhausted` stop. Breaking *before*
+     matching (as an earlier design did) would discover, persist, and then silently drop
+     the final pass's professors from the delivered count.
+   - **An empty/zero-survivor batch is no longer exhaustion by itself.** Because discovery
+     now pages past the first OpenAlex page, a pass that pulls authors but drops every one
+     at email validation has *explored deeper ranks* — it returns `exhausted=False` and a
+     non-empty `attempted_ids`, so the loop keeps going (counted toward the empty-batch
+     streak below). The stop signal is the explicit `exhausted` flag — "OpenAlex truly has
+     no more authors" — never "this pass had no survivors." **Superseded:** the old
+     `if not topup_attempted_ids: break` empty-batch heuristic is gone.
 3. **Empty-batch streak** — a **non-productive pass** is one that pulled new authors
-   (non-empty `attempted_ids`) but added **zero newly-matched** professors
-   (`new_have <= have`). Two distinct causes are folded into this one bucket and treated
-   **uniformly** — each counts as exactly one non-productive pass:
+   (non-empty `attempted_ids`) but added **zero newly-matched** professors. The progress
+   test compares the recomputed `have` against the pass's starting count
+   (`new_have > have_before_pass`, captured at the top of the pass). Two distinct causes
+   are folded into this one bucket and treated **uniformly** — each counts as exactly one
+   non-productive pass:
    - **(a) zero survivors** — every pulled author was dropped at email validation, so no
      new professor was persisted. When this happens the match step is **skipped**
      entirely (the `if topup_prof_ids:` guard — there is nothing to match), and the pass
      still counts toward the streak.
    - **(b) survivors matched no project** — new professors were persisted and matched,
-     but none gained a matchable project, so `have` didn't grow.
+     but none gained a matchable project, so the count didn't grow.
 
    A single non-productive pass no longer stops the search: the loop tolerates up to
    `MAX_EMPTY_TOPUP_BATCHES = 5` **consecutive** such passes before giving up. The streak
-   (`empty_batches`) **resets to 0** the moment any pass adds at least one new match
-   (`new_have > have`), so the loop keeps reaching for matchable professors that are still
-   out there instead of quitting on the first dry pass. It breaks only when the streak
-   hits 5 in a row.
+   (`empty_batches`) **resets to 0** the moment any pass adds at least one new match, so
+   the loop keeps reaching for matchable professors that are still out there instead of
+   quitting on the first dry pass. It breaks only when the streak hits 5 in a row. This
+   guard and the runaway guard below are **unchanged** by the paging/exhaustion rework —
+   they still handle every non-productive (pulled-but-unmatched) pass; only the genuine
+   exhaustion stop (condition 2) changed.
 4. **Runaway guard** — `MAX_DISCOVERY_PASSES = 10` (1 initial pass + up to 9 top-ups).
    In practice the exhaustion / empty-streak terminations fire first; this constant only
    bounds pathological non-progress the other checks miss. When it trips it `break`s into
@@ -318,7 +363,7 @@ limits.
 | Endpoint | What we ask | Filter / sort |
 |---|---|---|
 | `GET /topics` | Candidate topic IDs for a free-text field | `?search={field}&per_page=10` |
-| `GET /authors` | Top-cited academic authors in those topics | `?filter=topics.id:{T…}\|{T…},last_known_institutions.type:education,works_count:>10&sort=cited_by_count:desc` |
+| `GET /authors` | Top-cited academic authors in those topics — **cursor-paged** | `?filter=topics.id:{T…}\|{T…},last_known_institutions.type:education,works_count:>10&sort=cited_by_count:desc&per_page=200&cursor=*` (follows `meta.next_cursor`, up to `_MAX_AUTHOR_PAGES`) |
 | `GET /works` | 5 most recent works per author | `?filter=author.id:{A…}&sort=publication_date:desc&per_page=5` |
 
 Reference docs:
@@ -411,8 +456,12 @@ Pass `user_interests=[]` (the default) to fall back to field-only picking.
 
 ## Over-fetch then filter
 
-We fetch `count * 3` authors from `/authors` and try to enrich every one in
-parallel. Why over-fetch?
+We assemble an over-fetch pool of `count * 3` NEW authors from `/authors` and try to
+enrich every one in parallel. The pool is built by `_list_authors`, which **cursor-pages**
+OpenAlex (skipping `exclude_ids` per page) until it holds `count * OVERFETCH_MULTIPLIER`
+non-excluded authors, OpenAlex runs out, or the `_MAX_AUTHOR_PAGES` cap is hit (see
+[The `exclude_ids` contract](#the-exclude_ids-contract-how-passes-make-progress)). Why
+over-fetch?
 
 - **~20–30% of candidates lose email** in the Tavily + LLM step (no faculty page
   surfaced; results are in PDFs not crawled; email obfuscated as "name [at] mit
@@ -421,6 +470,18 @@ parallel. Why over-fetch?
 - 3x is a starting point; if we see consistently higher drop rates, raise to 4x or
   add a second Tavily query pattern. The constant lives at
   `discovery.OVERFETCH_MULTIPLIER`.
+
+**Cost invariant — paging is free, enrichment is paid.** Cursor-paging OpenAlex to *find*
+candidates costs nothing (OpenAlex needs no API key and isn't metered per request the way
+the polite pool is used here). Only the bounded over-fetch pool of
+`count * OVERFETCH_MULTIPLIER` authors is ever enriched (the paid Tavily search + Haiku
+extraction), so paging *deeper* across passes does **not** raise per-run spend — the paid
+budget is identical to the old single-page behavior. The `_MAX_AUTHOR_PAGES` cap exists for
+the same reason: a deliberate design choice to **prioritize bounded cost over hitting the
+exact requested count**. A pathological field (huge `exclude_ids`, near-exhausted topic)
+could otherwise page forever chasing the last few candidates; instead we cap the paging,
+let the pass return what it found (`exhausted=False`), and let the empty-batch streak /
+runaway guard / partial-delivery gate absorb the shortfall.
 
 If fewer than `count` survive, `find_professors` logs a warning and returns what we
 have rather than failing — a single pass is best-effort by design. This is **not** the
@@ -549,13 +610,18 @@ worse than false negatives (losing a legitimate candidate).
 - **OpenAlex** has no published per-day limit for polite-pool users, but it
   recommends keeping concurrent requests modest. The per-stage Anthropic
   concurrency semaphore (`settings.anthropic_concurrency`, default **3**) also
-  governs the per-author OpenAlex fan-out — well below anything they'd throttle.
+  governs the per-author OpenAlex `/works` fan-out — well below anything they'd throttle.
+  The new author-list paging in `_list_authors` is **sequential** (each page needs the
+  previous page's `next_cursor`) and bounded at `_MAX_AUTHOR_PAGES` (10) requests per pass,
+  so it adds at most a handful of cheap, serial `/authors` calls — no concurrency concern.
 - **Tavily free tier** is around 1,000 requests/month at the time of writing. Each
-  discovery *pass* uses up to `(count + len(exclude_ids)) * 3` Tavily requests (one per
-  *new* candidate enriched — excluded IDs are filtered out before enrichment and cost
-  nothing). A single-pass 10-person run = ~30 requests; a run that needs top-up passes
-  spends a bit more per shortfall pass. You can do roughly ~30 single-pass runs/month on
-  the free tier.
+  discovery *pass* uses up to `count * 3` Tavily requests (one per *new* candidate
+  enriched — excluded IDs are skipped during OpenAlex paging, before enrichment, and cost
+  nothing). The over-fetch pool is bounded at `count * OVERFETCH_MULTIPLIER` regardless of
+  how deep paging goes to *find* those new authors, so the paid budget per pass is fixed
+  and **independent of `len(exclude_ids)`**. A single-pass 10-person run = ~30 requests; a
+  run that needs top-up passes spends a bit more per shortfall pass. You can do roughly ~30
+  single-pass runs/month on the free tier.
 - **Anthropic** is governed by your account's RPM/TPM. Each run does 1
   `_llm_pick_topics` call per pass + one `_llm_extract_email` call per *new* candidate
   enriched. For a single-pass 10-person run that's ~31 calls; top-up passes add more.
@@ -573,7 +639,7 @@ worse than false negatives (losing a legitimate candidate).
 |---|---|---|
 | `OpenAlex returned no topics for field 'comp neuro'` | Field is too colloquial | Try the standard term: `"computational neuroscience"` |
 | `Could not match field 'X' to an OpenAlex topic` | Topics found but LLM rejected all | The pick prompt got too strict — try a synonym, or relax the prompt |
-| `OpenAlex returned no authors for field 'X'` | Topic matched but no qualifying authors | Topic is too narrow / too new; broaden the field |
+| `OpenAlex returned no authors for field 'X'` | Topic matched but no qualifying authors — **initial pass only** (top-up passes with a non-empty `exclude_ids` instead return an empty `DiscoveryResult` with `exhausted` set, so the loop stops cleanly rather than failing) | Topic is too narrow / too new; broaden the field |
 | `Wanted N professors but only M survived...` (log warning, single pass) | Email resolution drop rate higher than expected on that pass | Informational — the CLI top-up loop will discover more. A persistent shortfall surfaces as the partial-delivery warning below |
 | `Found M of N professors with a matched project. Drafting the M we have.` (warning, exit 0, run ends in REVIEW) | The field couldn't supply `count` professors with both an academic email and a matchable project, even after top-up | This is a successful **partial delivery**, not a failure: the M matched professors are drafted. To get closer to `count`, broaden the field, lower the count, or rerun later. Discovered professors + matches stay saved |
 | `ANTHROPIC_API_KEY is not set` / `TAVILY_API_KEY is not set` | Missing env var | Add to `.env` |
@@ -600,8 +666,9 @@ and rendered as `Error: <message>`.
 
 **Too broad** (e.g., user types "biology" and we get 50,000 authors):
 
-- `/authors?sort=cited_by_count:desc&per_page=N` already returns the top N by
-  citations, so the breadth doesn't blow up costs — but the relevance to the user's
+- `/authors?sort=cited_by_count:desc` returns authors top-cited-first, and
+  `_list_authors` only collects a bounded `count * OVERFETCH_MULTIPLIER` pool (then stops
+  paging), so the breadth doesn't blow up costs — but the relevance to the user's
   interests likely will. The matching step (Step 5) will drop most of them, leading
   to many empty drafts.
 - Mitigation: `pick_topics.txt` already steers Claude toward topics whose `field`
@@ -614,11 +681,15 @@ and rendered as `Error: <message>`.
 To add a new academic data source (e.g., Semantic Scholar):
 
 1. Add a fetcher: `async def _list_authors_semantic_scholar(http, field, count)`
-   returning the same `dict` shape used by the OpenAlex path.
-2. In `find_professors`, after `_list_authors`, merge `_list_authors_semantic_scholar`
-   results, then run them through the existing `_dedup_authors` (which already
-   de-dupes by name + institution + department) before enrichment — that way a
-   professor surfaced by both sources is enriched once.
+   returning the same `dict` shape used by the OpenAlex path. To match the OpenAlex path's
+   exclude-during-paging contract, accept `exclude_ids` and skip them as you page (and,
+   ideally, return an `exhausted` signal of your own so the top-up loop can stop on it).
+2. In `find_professors`, after `_list_authors` (whose `_AuthorPool.authors` is the OpenAlex
+   pool), merge `_list_authors_semantic_scholar` results into `authors`, then run them
+   through the existing `_dedup_authors` (which already de-dupes by name + institution +
+   department) before enrichment — that way a professor surfaced by both sources is
+   enriched once. Combine the two sources' exhaustion signals (e.g. `exhausted` only when
+   *both* are exhausted) when setting `DiscoveryResult.exhausted`.
 3. Update `docs/04-discovery.md` (this file) and add tests with fixture JSON for
    the new source's response shape.
 4. New env var for any API key needed; add to `config.py` and `.env.example`.
