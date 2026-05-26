@@ -706,8 +706,12 @@ async def find_professors(
     to avoid re-pulling and re-paying for the same top-cited authors that were
     dropped for lacking an email.
 
-    `user_interests` is accepted for future use (e.g., narrowing the author pool)
-    but not currently consulted — matching against interests happens in Step 5.
+    `user_interests` IS consulted — for topic resolution: it flows through
+    `_resolve_topics` into both the OpenAlex `/topics` searches and the LLM topic
+    pick, so it shapes WHICH topics we pull authors from. What is not yet
+    implemented is using it to NARROW the author pool within those topics — the
+    `/authors` query is by topic + citation count only, and per-author relevance
+    ranking against interests happens later in Step 5 (matching).
 
     `exclude_ids` holds short-form OpenAlex author IDs (same form as
     `ProfessorCandidate.openalex_id`) already discovered earlier in this run. They
