@@ -101,7 +101,7 @@ history lives in a new `RunUsage` table rather than new columns on `runs`.
 |---|---|
 | `scholarapp/cli.py` | `run` command: `--budget`/`--yes` options, estimate+confirm gate, `_over_budget`, `_recent_cost_history`, `_persist_run_usage`, budget-stop wiring |
 | `scholarapp/usage.py` | `STAGES`, `estimate_run_cost`, `stage_costs_from_tracker`, `pack_stage_usage`/`unpack_stage_usage`, `StageEstimate`/`CostEstimate`/`RunCostSample` dataclasses (plus the pre-existing `PRICING`/`UsageTracker`) |
-| `scholarapp/config.py` | `Settings.run_max_usd`, `_env_float`, `RUN_MAX_USD` env parsing |
+| `scholarapp/config.py` | `Settings.run_max_usd` (lazy `@property`), `_parse_float`/`_parse_int`, `RUN_MAX_USD` raw-string capture + lazy parsing |
 | `scholarapp/db/models.py` | `RunUsage` table |
 | `scholarapp/db/repo.py` | `add_run_usage`, `list_recent_run_usage` |
 | `scholarapp/db/session.py` | idempotent `init_db()` / `create_all` that auto-creates `run_usage` |
@@ -118,9 +118,11 @@ history lives in a new `RunUsage` table rather than new columns on `runs`.
 
 ### Environment variable
 
-- `RUN_MAX_USD` — optional default ceiling, parsed by `config._env_float` into
-  `Settings.run_max_usd`. Unset (or empty) means `None` (no ceiling). `--budget`
-  overrides it for a single run.
+- `RUN_MAX_USD` — optional default ceiling, parsed by `config._parse_float`
+  **lazily** through the `Settings.run_max_usd` accessor (the raw string is
+  captured at `load_settings()` and only parsed when read). Unset (or empty)
+  means `None` (no ceiling). A non-numeric value raises `ConfigError` when read,
+  which surfaces only on `scholar run`. `--budget` overrides it for a single run.
 
 ### Estimation / persistence functions
 
@@ -208,7 +210,7 @@ static.
 
 | Knob | Where | Default | Behavior |
 |---|---|---|---|
-| `RUN_MAX_USD` | env var (`config.py`) | none (`None`) | Sticky default ceiling. Empty/unset means no ceiling. Must be finite and non-negative; a malformed value hard-stops `scholar run`. |
+| `RUN_MAX_USD` | env var (`config.py`) | none (`None`) | Sticky default ceiling. Empty/unset means no ceiling. Parsed **lazily** on access (`Settings.run_max_usd` via `config._parse_float`): a non-numeric value (e.g. `RUN_MAX_USD=abc`) raises `ConfigError` only when a command that reads it runs — for this var, `scholar run` — so it hard-stops cleanly there and leaves unrelated commands (`scholar list`, `scholar init`) unaffected. Must also be finite and non-negative (that NaN/inf/negative check still lives in the run flow). |
 | `--budget` | `scholar run` option | none | Per-run ceiling; **overrides** `RUN_MAX_USD` when given. Must be finite and non-negative; a malformed value hard-stops the run. |
 | `--yes` / `-y` | `scholar run` option | off | Skip the confirmation prompt. |
 
@@ -222,10 +224,16 @@ meaning no ceiling) or a **finite, non-negative** dollar amount. Specifically:
 - **Exactly `0`** → a *valid* ceiling, not an error. Since any non-trivial
   estimate is `> 0`, a zero budget simply trips the existing refuse-to-start
   check below — it refuses to run anything that would cost money.
-- **Non-finite (`NaN`, `inf`, `-inf`) or negative** → rejected as malformed. The
-  run hard-stops *before any paid work* (no discovery, no drafts, no `run_usage`
-  row), raising `ConfigError` (`scholarapp/errors.py`) which `_run_safely`
-  renders as `ui.error` + exit code 1.
+- **Non-numeric (e.g. `RUN_MAX_USD=abc`)** → rejected at parse time. The
+  `Settings.run_max_usd` accessor (via `config._parse_float`) raises `ConfigError`
+  naming the variable and the offending value the first time `scholar run` reads
+  it. Because parsing is lazy, this happens only on a command that uses the
+  setting — unrelated commands never trip it.
+- **Non-finite (`NaN`, `inf`, `-inf`) or negative** → rejected as malformed. These
+  parse fine as floats, so they slip past `_parse_float` and are caught instead by
+  the explicit check in the run flow. The run hard-stops *before any paid work* (no
+  discovery, no drafts, no `run_usage` row), raising `ConfigError`
+  (`scholarapp/errors.py`) which `_run_safely` renders as `ui.error` + exit code 1.
 
 The check lives at the single convergence point in `cli.py`'s `run` body, right
 after `effective_budget = budget if budget is not None else settings.run_max_usd`
@@ -272,12 +280,28 @@ protects them.
   treated as "no ceiling" — that would defeat a cost guard the user explicitly
   set. A budget of exactly `0` is *not* malformed; it is a valid ceiling that
   trips refuse-to-start.
-- **Validation lives in the run flow, not in `config.py`.** `config._env_float`
-  deliberately does *not* raise on a non-finite/negative `RUN_MAX_USD`, so
-  unrelated commands (`scholar list`, `scholar init`) that call `load_settings()`
-  don't crash on a bad env value. The policy is enforced only on the spending
-  path, at the single point where `--budget` and `RUN_MAX_USD` converge in the
-  `run` body.
+- **Numeric env vars are parsed lazily — a malformed value never crashes an
+  unrelated command.** `load_settings()` captures the raw env strings for the four
+  numeric settings (`RUN_MAX_USD`, `SEND_DAILY_CAP`, `ANTHROPIC_CONCURRENCY`,
+  `ANTHROPIC_MAX_RETRIES`) without parsing them; the matching `@property`
+  accessors in `config.py` parse on access via `_parse_float`/`_parse_int`. A
+  non-numeric value (e.g. `RUN_MAX_USD=abc`) therefore raises a controlled
+  `ConfigError` — naming the variable and the bad value, rendered by `_run_safely`
+  as `ui.error` + `Exit(1)` — *only* from a command that actually reads that
+  setting (for `RUN_MAX_USD`, `scholar run`). Commands that never touch it
+  (`scholar list`, `scholar init`) keep working, and `load_settings()` itself never
+  raises on these. Unset/empty still yields each setting's default; valid values
+  behave exactly as before. This replaces the old eager parse that crashed with a
+  raw `ValueError` traceback from whatever command happened to load settings first.
+- **Validation lives in two complementary places for `RUN_MAX_USD`.** The
+  *non-numeric* parse failure is caught lazily in `config.py` (above). The
+  *non-finite (`NaN`/`±inf`) or negative* check is unchanged and lives in the run
+  flow, at the single point where `--budget` and `RUN_MAX_USD` converge in the
+  `run` body — non-finite/negative values parse fine as floats, so `_parse_float`
+  passes them through and the run flow rejects them. Together, non-numeric, NaN/inf,
+  and negative budgets are all handled cleanly: each raises `ConfigError` and
+  hard-stops the run before any paid work, never a traceback and never a silent
+  fallback to "no ceiling".
 - **The estimator stays DB-free.** `usage.py` never imports `db`; it does
   arithmetic over `RunCostSample`s passed in. The CLI performs all reads
   (`_recent_cost_history`) and writes (`_persist_run_usage`). Keep it that way
@@ -308,7 +332,7 @@ protects them.
 | Test file | Covers |
 |---|---|
 | `tests/test_usage.py` | `estimate_run_cost` (static vs historical basis, sample threshold, count scaling), `stage_costs_from_tracker`, dataclass invariants, and the unpriced markers (`CallRecord.is_priced`, `UsageTracker.has_unpriced_calls`) |
-| `tests/test_config.py` | `RUN_MAX_USD` / `_env_float` parsing into `Settings.run_max_usd` |
+| `tests/test_config.py` | lazy numeric env parsing into the `Settings` `@property` accessors — `RUN_MAX_USD` (unset/blank/float/int, malformed raises `ConfigError`, `inf`/`nan` parse through), the other numeric vars (`SEND_DAILY_CAP` etc.) raising `ConfigError` on a non-numeric value, and that a bad value doesn't break a command that never reads it |
 | `tests/test_run_usage_repo.py` | `add_run_usage` / `list_recent_run_usage` round-trip and ordering |
 | `tests/test_ui.py` | `cost_estimate_panel` and `budget_stop_notice` rendering (including the `unpriced=True` fail-closed variant) |
 | `tests/test_cli_topup.py` | `scholar run` integration: estimate gate, refuse-to-start, confirm/decline, mid-run budget stop + partial delivery, the fail-closed stop on unpriced spend (and that a no-budget run is unaffected), and budget validation — malformed `--budget`/`RUN_MAX_USD` (`NaN`/`±inf`/negative) hard-stop, and a zero budget being a valid ceiling that refuses to start |
