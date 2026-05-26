@@ -152,12 +152,29 @@ per-run `_STATIC_FIXED_USD` discovery add-on for `pick_topics`). Samples with
 
 | Knob | Where | Default | Behavior |
 |---|---|---|---|
-| `RUN_MAX_USD` | env var (`config.py`) | none (`None`) | Sticky default ceiling. Empty/unset means no ceiling. |
-| `--budget` | `scholar run` option | none | Per-run ceiling; **overrides** `RUN_MAX_USD` when given. |
+| `RUN_MAX_USD` | env var (`config.py`) | none (`None`) | Sticky default ceiling. Empty/unset means no ceiling. Must be finite and non-negative; a malformed value hard-stops `scholar run`. |
+| `--budget` | `scholar run` option | none | Per-run ceiling; **overrides** `RUN_MAX_USD` when given. Must be finite and non-negative; a malformed value hard-stops the run. |
 | `--yes` / `-y` | `scholar run` option | off | Skip the confirmation prompt. |
 
 Effective budget = `--budget` if provided, else `settings.run_max_usd`, else
 `None` (unbounded; the estimate is then purely informational).
+
+**Valid budget values.** The effective ceiling must be either unset (`None`,
+meaning no ceiling) or a **finite, non-negative** dollar amount. Specifically:
+
+- **Unset / empty** → `None`, unbounded (unchanged).
+- **Exactly `0`** → a *valid* ceiling, not an error. Since any non-trivial
+  estimate is `> 0`, a zero budget simply trips the existing refuse-to-start
+  check below — it refuses to run anything that would cost money.
+- **Non-finite (`NaN`, `inf`, `-inf`) or negative** → rejected as malformed. The
+  run hard-stops *before any paid work* (no discovery, no drafts, no `run_usage`
+  row), raising `ConfigError` (`scholarapp/errors.py`) which `_run_safely`
+  renders as `ui.error` + exit code 1.
+
+The check lives at the single convergence point in `cli.py`'s `run` body, right
+after `effective_budget = budget if budget is not None else settings.run_max_usd`
+and before the refuse-to-start check, so `--budget` and `RUN_MAX_USD` are policed
+identically regardless of source.
 
 **Confirmation behavior.** The prompt only appears when `sys.stdin.isatty()` is
 true and `--yes` was not passed. Non-interactive sessions (CI, the test runner,
@@ -178,6 +195,18 @@ protects them.
   calls (and a resume-cache hit makes the resume parse free).
 - **Refuse-to-start.** If the budget is below the estimated total, the run never
   discovers — `ui.error` + `Exit(1)`.
+- **A malformed budget is fail-closed.** A non-finite (`NaN`/`±inf`) or negative
+  effective ceiling hard-stops the run before any spend, raising `ConfigError`
+  (rendered by `_run_safely` as `ui.error` + `Exit(1)`). It is never silently
+  treated as "no ceiling" — that would defeat a cost guard the user explicitly
+  set. A budget of exactly `0` is *not* malformed; it is a valid ceiling that
+  trips refuse-to-start.
+- **Validation lives in the run flow, not in `config.py`.** `config._env_float`
+  deliberately does *not* raise on a non-finite/negative `RUN_MAX_USD`, so
+  unrelated commands (`scholar list`, `scholar init`) that call `load_settings()`
+  don't crash on a bad env value. The policy is enforced only on the spending
+  path, at the single point where `--budget` and `RUN_MAX_USD` converge in the
+  `run` body.
 - **The estimator stays DB-free.** `usage.py` never imports `db`; it does
   arithmetic over `RunCostSample`s passed in. The CLI performs all reads
   (`_recent_cost_history`) and writes (`_persist_run_usage`). Keep it that way
@@ -199,7 +228,7 @@ protects them.
 | `tests/test_config.py` | `RUN_MAX_USD` / `_env_float` parsing into `Settings.run_max_usd` |
 | `tests/test_run_usage_repo.py` | `add_run_usage` / `list_recent_run_usage` round-trip and ordering |
 | `tests/test_ui.py` | `cost_estimate_panel` and `budget_stop_notice` rendering |
-| `tests/test_cli_topup.py` | `scholar run` integration: estimate gate, refuse-to-start, confirm/decline, mid-run budget stop + partial delivery |
+| `tests/test_cli_topup.py` | `scholar run` integration: estimate gate, refuse-to-start, confirm/decline, mid-run budget stop + partial delivery, and budget validation — malformed `--budget`/`RUN_MAX_USD` (`NaN`/`±inf`/negative) hard-stop, and a zero budget being a valid ceiling that refuses to start |
 
 Run:
 
