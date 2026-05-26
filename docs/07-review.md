@@ -62,6 +62,52 @@ The format round-trips exactly: read → write → read returns the same content
 You can hand-write a file in this shape and it'll parse — the format is
 intentionally human-friendly.
 
+### File encoding (read this before touching draft I/O)
+
+All draft file I/O is pinned to UTF-8 and goes through the `_read_text` /
+`_write_text` helpers in
+[scholarapp/modules/review.py](../scholarapp/modules/review.py) (the
+`_FILE_ENCODING = "utf-8"` constant). Every read and write site —
+`parse_draft_file`, `write_status_in_file`, `write_drafts_to_disk` — is routed
+through them.
+
+This is what lets drafts hold arbitrary Unicode that Claude routinely emits —
+the Unicode hyphen U+2010, en/em dashes, curly quotes — without crashing. On
+Windows the OS default encoding is cp1252, which **cannot** encode those
+characters and raises `UnicodeEncodeError` on write; pinning UTF-8 on both sides
+of the round-trip removes that failure mode.
+
+`_read_text` is UTF-8-first but tolerant of legacy on-disk files. A valid UTF-8
+draft reads exactly as before; only when the strict UTF-8 decode raises
+`UnicodeDecodeError` does it fall back to cp1252
+(`_LEGACY_FILE_ENCODING = "cp1252"`) and log a warning. This matters because
+older versions wrote drafts with the Windows locale default (cp1252), so those
+files can carry bytes that aren't valid UTF-8 — e.g. an en-dash stored as the
+single byte `0x96` — and would otherwise crash `approve` / `sync` with
+`UnicodeDecodeError`. cp1252 is used (not latin-1, not `errors="replace"`)
+because it's the accurate inverse of what wrote those files: `0x96` → U+2013, the
+en-dash the author intended, whereas latin-1 would mis-map the `0x80`–`0x9F`
+range and `errors="replace"` would corrupt the glyph. The fallback is read-only
+and self-healing: writes stay UTF-8 (`_write_text`), so a draft read via the
+fallback is normalized to UTF-8 the next time the normal flow rewrites it — there
+is no separate migration step.
+
+`_write_text` also passes `newline=""` to disable Python's platform newline
+translation. Without it, the `\n` in rendered content would be rewritten to
+`\r\n` on disk and read back as `\n`, so the bytes wouldn't be stable across a
+write → read round-trip — which would also make conflict detection (the
+`updated_at` snapshot comparison, below) fire spuriously even when nothing
+changed.
+
+The same UTF-8 pinning applies to the run command's prompt and template input
+reads in [scholarapp/cli.py](../scholarapp/cli.py) (`read_text(encoding="utf-8")`).
+
+**Constraint for future editors:** any new draft-file read or write must go
+through `_read_text` / `_write_text` (or otherwise pass `encoding="utf-8"`, and
+`newline=""` on writes). Do not reintroduce a bare `read_text()` /
+`write_text()` — that falls back to the locale-default code page and reopens the
+Windows crash.
+
 ## Editable vs read-only fields
 
 | Field | Status | Reason |
@@ -217,6 +263,11 @@ those fresh files.
 For a single-user CLI this is mostly defensive plumbing — you'd notice the
 warning, decide which side has the right version, and act. Multi-user setups
 (if scholarapp ever has one) would need stronger locking.
+
+This snapshot comparison is also why draft writes use `newline=""` (see [File
+encoding](#file-encoding-read-this-before-touching-draft-io)): a write that
+silently rewrote `\n` to `\r\n` would perturb the round-trip and could trip this
+warning on files nobody actually edited.
 
 ## CLI usage
 

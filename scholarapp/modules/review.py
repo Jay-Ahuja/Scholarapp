@@ -102,6 +102,54 @@ class SyncReport(BaseModel):
 
 _SLUG_NONALNUM = re.compile(r"[^a-z0-9-]+")
 
+# Draft files routinely contain non-ASCII characters Claude emits (the Unicode
+# hyphen U+2010, en/em dashes, curly quotes). Pin UTF-8 on every text read/write
+# so the round-trip is stable regardless of the platform's locale code page
+# (cp1252 on Windows can't encode these and raises UnicodeEncodeError).
+_FILE_ENCODING = "utf-8"
+
+# Legacy fallback for the READ path only. Older versions wrote draft files using
+# the Windows locale default (cp1252), so on-disk files can carry bytes like 0x96
+# (cp1252 en-dash) that aren't valid UTF-8. cp1252 is the accurate inverse of what
+# wrote those files (0x96 -> U+2013 en-dash); latin-1 would mis-map 0x80-0x9F and
+# errors="replace"/"ignore" would corrupt the glyph. Writes stay UTF-8, so any
+# file read via this fallback is normalized to UTF-8 the next time it's rewritten
+# by the normal flow — self-healing, no migration step needed.
+_LEGACY_FILE_ENCODING = "cp1252"
+
+
+def _read_text(path: Path) -> str:
+    """Read a draft text file with universal-newline translation.
+
+    UTF-8 first; on a UTF-8 decode failure, fall back to cp1252 (the legacy
+    locale-default encoding older versions wrote on Windows) and warn. A valid
+    UTF-8 file reads exactly as before — the fallback only engages when the
+    strict UTF-8 decode raises.
+
+    Universal newlines (the default) collapse any \\r\\n on disk back to \\n so
+    parsing and write->read equality stay platform-independent.
+    """
+    try:
+        return path.read_text(encoding=_FILE_ENCODING)
+    except UnicodeDecodeError:
+        logger.warning(
+            "%s is not valid UTF-8; falling back to %s (legacy encoding). "
+            "Re-saving this draft through the normal flow will normalize it to UTF-8.",
+            path.name,
+            _LEGACY_FILE_ENCODING,
+        )
+        return path.read_text(encoding=_LEGACY_FILE_ENCODING)
+
+
+def _write_text(path: Path, content: str) -> None:
+    """Write a draft text file as UTF-8 without newline translation.
+
+    `newline=""` disables the platform line-ending translation so the bytes on
+    disk keep the \\n that callers render; this keeps the write->read round-trip
+    and sync's conflict-detection snapshot byte-stable on Windows.
+    """
+    path.write_text(content, encoding=_FILE_ENCODING, newline="")
+
 
 def _to_naive_utc(dt: datetime) -> datetime:
     """Normalize a datetime to naive UTC for comparison.
@@ -171,7 +219,7 @@ def _split_subject_and_body(rest: str) -> tuple[str, str]:
 
 def parse_draft_file(path: Path) -> ParsedDraft:
     """Read a draft markdown file and return its typed contents."""
-    text = path.read_text()
+    text = _read_text(path)
     fm, rest = _split_frontmatter(text)
     subject, body = _split_subject_and_body(rest)
 
@@ -235,13 +283,13 @@ def write_status_in_file(path: Path, new_status: str) -> None:
     Preserves every other byte of the file.
     """
     parsed = parse_draft_file(path)
-    text = path.read_text()
+    text = _read_text(path)
     fm, rest = _split_frontmatter(text)
     fm["status"] = new_status
     new_yaml = yaml.safe_dump(
         fm, sort_keys=False, allow_unicode=True, default_flow_style=False
     )
-    path.write_text(f"---\n{new_yaml}---\n{rest}")
+    _write_text(path, f"---\n{new_yaml}---\n{rest}")
 
 
 # ---------------------------------------------------------------------------
@@ -311,7 +359,7 @@ def write_drafts_to_disk(run_id: str) -> Path:
                 subject=draft.subject,
                 body=draft.body,
             )
-            file_path.write_text(content)
+            _write_text(file_path, content)
 
     return drafts_dir
 

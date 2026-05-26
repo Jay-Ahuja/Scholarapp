@@ -113,7 +113,7 @@ def init() -> None:
         settings = load_settings()
         settings.data_dir.mkdir(parents=True, exist_ok=True)
         if not settings.config_path.exists():
-            settings.config_path.write_text(DEFAULT_CONFIG_TOML)
+            settings.config_path.write_text(DEFAULT_CONFIG_TOML, encoding="utf-8")
             ui.info(f"[green]Created[/green] {settings.config_path}")
         else:
             ui.info(f"[dim]Already exists:[/dim] {settings.config_path}")
@@ -369,14 +369,14 @@ def run(
 
         ui.info(f"Parsing prompt: [bold]{prompt_path}[/bold]")
         with ui.spinner("Parsing prompt with Claude..."):
-            prompt_data = ingestion.parse_prompt(prompt_path.read_text())
+            prompt_data = ingestion.parse_prompt(prompt_path.read_text(encoding="utf-8"))
         ui.info(
             f"Parsed prompt: field=[italic]{prompt_data.field}[/italic], "
             f"count=[bold]{prompt_data.count}[/bold], "
             f"goal=[italic]{prompt_data.goal}[/italic]"
         )
 
-        template_text = template_path.read_text()
+        template_text = template_path.read_text(encoding="utf-8")
 
         with get_session() as session:
             run_row = repo.create_run(
