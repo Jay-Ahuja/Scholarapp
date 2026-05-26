@@ -77,6 +77,21 @@ Windows the OS default encoding is cp1252, which **cannot** encode those
 characters and raises `UnicodeEncodeError` on write; pinning UTF-8 on both sides
 of the round-trip removes that failure mode.
 
+`_read_text` is UTF-8-first but tolerant of legacy on-disk files. A valid UTF-8
+draft reads exactly as before; only when the strict UTF-8 decode raises
+`UnicodeDecodeError` does it fall back to cp1252
+(`_LEGACY_FILE_ENCODING = "cp1252"`) and log a warning. This matters because
+older versions wrote drafts with the Windows locale default (cp1252), so those
+files can carry bytes that aren't valid UTF-8 — e.g. an en-dash stored as the
+single byte `0x96` — and would otherwise crash `approve` / `sync` with
+`UnicodeDecodeError`. cp1252 is used (not latin-1, not `errors="replace"`)
+because it's the accurate inverse of what wrote those files: `0x96` → U+2013, the
+en-dash the author intended, whereas latin-1 would mis-map the `0x80`–`0x9F`
+range and `errors="replace"` would corrupt the glyph. The fallback is read-only
+and self-healing: writes stay UTF-8 (`_write_text`), so a draft read via the
+fallback is normalized to UTF-8 the next time the normal flow rewrites it — there
+is no separate migration step.
+
 `_write_text` also passes `newline=""` to disable Python's platform newline
 translation. Without it, the `\n` in rendered content would be rewritten to
 `\r\n` on disk and read back as `\n`, so the bytes wouldn't be stable across a
