@@ -697,8 +697,8 @@ def test_find_professors_excludes_ids_before_enrichment(monkeypatch, mock_discov
     assert result.attempted_ids == {"A2", "A3"}
 
 
-def test_find_professors_sizes_fetch_up_by_exclude_count(monkeypatch, mock_discovery_env):
-    """The OpenAlex /authors per_page grows by len(exclude_ids) so NEW candidates fit."""
+def test_find_professors_pages_authors_with_cursor(monkeypatch, mock_discovery_env):
+    """OpenAlex /authors is fetched via cursor paging at the polite-pool page size."""
     async def _email(_client, _name, _inst, _results):
         return discovery._EmailExtraction(email="p@mit.edu", faculty_page_url=None)
 
@@ -727,15 +727,88 @@ def test_find_professors_sizes_fetch_up_by_exclude_count(monkeypatch, mock_disco
         c for c in fake_http.calls
         if c["url"].startswith("https://api.openalex.org/authors")
     )
-    # target_pool = (count + len(exclude_ids)) * OVERFETCH_MULTIPLIER = (2+3)*3 = 15.
-    expected_pool = (2 + 3) * discovery.OVERFETCH_MULTIPLIER
-    assert authors_call["params"]["per_page"] == max(25, expected_pool)
+    # Paging no longer sizes per_page up by exclude count — it pages (free) until
+    # the pool fills, skipping excluded IDs at the source. The first page uses the
+    # cursor entrypoint and the polite-pool page size.
+    assert authors_call["params"]["per_page"] == discovery._AUTHORS_PER_PAGE
+    assert authors_call["params"]["cursor"] == "*"
+    assert "topics.id:C1" in authors_call["params"]["filter"]
 
 
-def test_find_professors_exclude_none_preserves_initial_fetch_size(
+def test_list_authors_follows_next_cursor_until_pool_filled(monkeypatch):
+    """_list_authors pages deeper when the first page is exhausted by excludes.
+
+    The first OpenAlex page is entirely excluded; only the SECOND page (reached
+    via next_cursor) holds fresh authors. The paged pool must surface them and
+    report exhausted=False (OpenAlex still had a further page to give).
+    """
+    page1 = {
+        "results": [_author(0), _author(1)],  # A0, A1 — both excluded
+        "meta": {"next_cursor": "CURSOR_2"},
+    }
+    page2 = {
+        "results": [_author(2), _author(3)],  # A2, A3 — fresh
+        "meta": {"next_cursor": "CURSOR_3"},
+    }
+
+    class _PagingClient(FakeAsyncClient):
+        async def request(self, method, url, **kwargs):
+            self.calls.append({"method": method, "url": url, **kwargs})
+            if url.startswith("https://api.openalex.org/authors"):
+                cursor = kwargs["params"]["cursor"]
+                return _FakeResponse(200, page1 if cursor == "*" else page2)
+            return _FakeResponse(404, {"results": []})
+
+    fake = _PagingClient({})
+    pool = asyncio.run(
+        discovery._list_authors(
+            fake, ["T1"], target_count=2, exclude_ids={"A0", "A1"}
+        )
+    )
+
+    assert [a["id"] for a in pool.authors] == [
+        "https://openalex.org/A2",
+        "https://openalex.org/A3",
+    ]
+    # The pool filled (target_count=2) before OpenAlex ran out → not exhausted.
+    assert pool.exhausted is False
+    # Two /authors requests: the first (all excluded) and the second (fresh).
+    author_calls = [
+        c for c in fake.calls if c["url"].startswith("https://api.openalex.org/authors")
+    ]
+    assert len(author_calls) == 2
+    assert author_calls[0]["params"]["cursor"] == "*"
+    assert author_calls[1]["params"]["cursor"] == "CURSOR_2"
+
+
+def test_list_authors_reports_exhausted_when_openalex_runs_out(monkeypatch):
+    """When OpenAlex returns no next_cursor before the pool fills, exhausted=True."""
+    page1 = {
+        "results": [_author(0)],  # only one author, then no further page
+        "meta": {"next_cursor": None},
+    }
+
+    class _SinglePageClient(FakeAsyncClient):
+        async def request(self, method, url, **kwargs):
+            self.calls.append({"method": method, "url": url, **kwargs})
+            if url.startswith("https://api.openalex.org/authors"):
+                return _FakeResponse(200, page1)
+            return _FakeResponse(404, {"results": []})
+
+    fake = _SinglePageClient({})
+    # Ask for a pool of 10 but OpenAlex only has 1 author and no next page.
+    pool = asyncio.run(
+        discovery._list_authors(fake, ["T1"], target_count=10, exclude_ids=set())
+    )
+
+    assert [a["id"] for a in pool.authors] == ["https://openalex.org/A0"]
+    assert pool.exhausted is True
+
+
+def test_find_professors_exclude_none_pages_from_cursor_entrypoint(
     monkeypatch, mock_discovery_env
 ):
-    """exclude_ids=None sizes the fetch exactly as before: count * OVERFETCH."""
+    """exclude_ids=None still pages from the cursor entrypoint at the page size."""
     async def _email(_client, _name, _inst, _results):
         return discovery._EmailExtraction(email="p@mit.edu", faculty_page_url=None)
 
@@ -760,6 +833,169 @@ def test_find_professors_exclude_none_preserves_initial_fetch_size(
         c for c in fake_http.calls
         if c["url"].startswith("https://api.openalex.org/authors")
     )
-    # Unchanged from baseline: min(200, max(25, count * OVERFETCH)) = min(200, 30) = 30.
-    expected = min(200, max(25, 10 * discovery.OVERFETCH_MULTIPLIER))
-    assert authors_call["params"]["per_page"] == expected
+    assert authors_call["params"]["per_page"] == discovery._AUTHORS_PER_PAGE
+    assert authors_call["params"]["cursor"] == "*"
+
+
+# ---------------------------------------------------------------------------
+# Paging exhaustion semantics surfaced through find_professors
+# ---------------------------------------------------------------------------
+
+
+class _CursorPagingClient(FakeAsyncClient):
+    """OpenAlex /authors paginated by cursor; other endpoints from `routes`.
+
+    `pages` is an ordered list of `results` lists; the client walks them via
+    next_cursor. After the last page, next_cursor is None (OpenAlex exhausted).
+    """
+
+    def __init__(self, routes: dict, pages: list[list[dict]]):
+        super().__init__(routes)
+        self.pages = pages
+
+    async def request(self, method, url, **kwargs):
+        self.calls.append({"method": method, "url": url, **kwargs})
+        if url.startswith("https://api.openalex.org/authors"):
+            cursor = kwargs["params"]["cursor"]
+            idx = 0 if cursor == "*" else int(cursor)
+            results = self.pages[idx] if idx < len(self.pages) else []
+            next_cursor = str(idx + 1) if idx + 1 < len(self.pages) else None
+            return _FakeResponse(200, {"results": results, "meta": {"next_cursor": next_cursor}})
+        for (m, prefix), payload in self.routes.items():
+            if m == method and url.startswith(prefix):
+                return _FakeResponse(200, payload)
+        return _FakeResponse(404, {"results": []})
+
+
+def test_find_professors_first_page_excluded_surfaces_deeper_authors(
+    monkeypatch, mock_discovery_env
+):
+    """(a) First page fully excluded, but deeper authors exist → discovery
+    surfaces them and reports exhausted=False (the loop should keep going)."""
+    async def _email(_client, _name, _inst, _results):
+        return discovery._EmailExtraction(email="p@mit.edu", faculty_page_url=None)
+
+    monkeypatch.setattr(discovery, "_llm_extract_email", _email)
+
+    routes = {
+        ("GET", "https://api.openalex.org/topics"): {
+            "results": [{"id": "https://openalex.org/C1", "display_name": "F", "level": 1}]
+        },
+        ("GET", "https://api.openalex.org/works"): {"results": []},
+        ("POST", "https://api.tavily.com/search"): {
+            "results": [{"title": "x", "url": "https://mit.edu/x", "content": "..."}]
+        },
+    }
+    # Page 1 is A0..A2 (all excluded); deeper pages hold plenty of fresh authors,
+    # MORE than the over-fetch pool needs (count=2 → target_pool=6). The pool fills
+    # from the deeper pages well before OpenAlex runs out → exhausted=False.
+    pages = [
+        [_author(0), _author(1), _author(2)],  # all excluded
+        [_author(i) for i in range(3, 9)],  # A3..A8 — fresh, fills the pool of 6
+        [_author(i) for i in range(9, 15)],  # A9..A14 — still more available
+    ]
+    fake_http = _CursorPagingClient(routes, pages)
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: fake_http)
+
+    result = asyncio.run(
+        discovery.find_professors(
+            "neuro", count=2, user_interests=[], exclude_ids={"A0", "A1", "A2"}
+        )
+    )
+
+    # Survivors come from the DEEPER pages — the first page was entirely excluded
+    # yet discovery still made progress (the core bug fix).
+    assert len(result.professors) == 2
+    assert all(r.name not in {"Prof 0", "Prof 1", "Prof 2"} for r in result.professors)
+    # Excluded first-page authors never reach enrichment / attempted_ids.
+    assert result.attempted_ids.isdisjoint({"A0", "A1", "A2"})
+    # The pool filled before OpenAlex ran out → NOT exhaustion. This is what stops
+    # the CLI loop from prematurely declaring the field exhausted.
+    assert result.exhausted is False
+    # We paged at least twice to get past the all-excluded first page.
+    author_calls = [
+        c for c in fake_http.calls
+        if c["url"].startswith("https://api.openalex.org/authors")
+    ]
+    assert len(author_calls) >= 2
+
+
+def test_find_professors_reports_exhausted_when_openalex_out_of_authors(
+    monkeypatch, mock_discovery_env
+):
+    """(b) OpenAlex genuinely out of new authors on a top-up → exhausted=True,
+    empty result (which the CLI loop reads as a stop)."""
+    async def _email(_client, _name, _inst, _results):
+        return discovery._EmailExtraction(email="p@mit.edu", faculty_page_url=None)
+
+    monkeypatch.setattr(discovery, "_llm_extract_email", _email)
+
+    routes = {
+        ("GET", "https://api.openalex.org/topics"): {
+            "results": [{"id": "https://openalex.org/C1", "display_name": "F", "level": 1}]
+        },
+        ("GET", "https://api.openalex.org/works"): {"results": []},
+        ("POST", "https://api.tavily.com/search"): {
+            "results": [{"title": "x", "url": "https://mit.edu/x", "content": "..."}]
+        },
+    }
+    # The only two authors OpenAlex has (A0, A1) are both excluded; no further
+    # page exists → genuine exhaustion for this top-up pass.
+    pages = [[_author(0), _author(1)]]
+    fake_http = _CursorPagingClient(routes, pages)
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: fake_http)
+
+    result = asyncio.run(
+        discovery.find_professors(
+            "neuro", count=3, user_interests=[], exclude_ids={"A0", "A1"}
+        )
+    )
+
+    assert result.professors == []
+    assert result.attempted_ids == set()
+    assert result.exhausted is True
+
+
+def test_find_professors_enrichment_count_stays_bounded_by_overfetch(
+    monkeypatch, mock_discovery_env
+):
+    """(c) Cost invariant: deeper paging does NOT increase enrichment. The number
+    of paid Tavily searches stays bounded by count * OVERFETCH_MULTIPLIER even
+    when many pages are paged to skip excluded authors."""
+
+    async def _email(_client, _name, _inst, _results):
+        return discovery._EmailExtraction(email="p@mit.edu", faculty_page_url=None)
+
+    monkeypatch.setattr(discovery, "_llm_extract_email", _email)
+
+    routes = {
+        ("GET", "https://api.openalex.org/topics"): {
+            "results": [{"id": "https://openalex.org/C1", "display_name": "F", "level": 1}]
+        },
+        ("GET", "https://api.openalex.org/works"): {"results": []},
+        ("POST", "https://api.tavily.com/search"): {
+            "results": [{"title": "x", "url": "https://mit.edu/x", "content": "..."}]
+        },
+    }
+    # Three pages of 5 fresh authors each (A0..A14) — far more than the over-fetch
+    # pool. count=2 → target_pool = 2*3 = 6, so only 6 authors should ever be
+    # enriched, not all 15, even though paging is free to walk all pages.
+    pages = [
+        [_author(i) for i in range(0, 5)],
+        [_author(i) for i in range(5, 10)],
+        [_author(i) for i in range(10, 15)],
+    ]
+    fake_http = _CursorPagingClient(routes, pages)
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: fake_http)
+
+    result = asyncio.run(
+        discovery.find_professors("neuro", count=2, user_interests=[])
+    )
+
+    tavily_calls = [
+        c for c in fake_http.calls if c["url"].startswith("https://api.tavily.com")
+    ]
+    bound = 2 * discovery.OVERFETCH_MULTIPLIER  # = 6
+    assert len(tavily_calls) == bound
+    # attempted_ids (the paid pool) is exactly the bounded over-fetch size.
+    assert len(result.attempted_ids) == bound

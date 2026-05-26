@@ -64,7 +64,9 @@ class _FakeDiscovery:
     returns up to `count` slugs not in `exclude_ids`, simulating OpenAlex's
     exclude-aware over-fetch. Every returned professor has an email, so the
     DiscoveryResult's `attempted_ids` equals the returned (survivor) slugs.
-    Records every call for assertions.
+    `exhausted` is True when the pool, after the exclude filter, no longer holds
+    more than `count` NEW slugs — i.e. OpenAlex (modeled as the finite `pool`) ran
+    out of fresh authors. Records every call for assertions.
     """
 
     def __init__(self, pool: list[str]):
@@ -83,15 +85,14 @@ class _FakeDiscovery:
         self.calls.append(
             {"field": field, "count": count, "exclude_ids": set(exclude)}
         )
-        out: list[discovery.ProfessorCandidate] = []
-        for slug in self.pool:
-            if len(out) >= count:
-                break
-            if slug in exclude:
-                continue
-            out.append(_candidate(slug))
+        available = [slug for slug in self.pool if slug not in exclude]
+        out = [_candidate(slug) for slug in available[:count]]
         return discovery.DiscoveryResult(
-            professors=out, attempted_ids={c.openalex_id for c in out}
+            professors=out,
+            attempted_ids={c.openalex_id for c in out},
+            # The finite pool is fully consumed when no more than `count` NEW slugs
+            # remain after the exclude filter → genuine exhaustion.
+            exhausted=len(available) <= count,
         )
 
 
@@ -299,11 +300,16 @@ class _PoolDiscovery:
     ) -> discovery.DiscoveryResult:
         exclude = set(exclude_ids or set())
         self.calls.append({"field": field, "count": count, "exclude_ids": exclude})
-        enriched = [s for s in self.pool if s not in exclude][:count]
+        available = [s for s in self.pool if s not in exclude]
+        enriched = available[:count]
         self.enriched_per_call.append(enriched)
         survivors = [_candidate(s) for s in enriched if s in self.with_email]
         return discovery.DiscoveryResult(
-            professors=survivors, attempted_ids=set(enriched)
+            professors=survivors,
+            attempted_ids=set(enriched),
+            # Exhausted once the finite pool has no more than `count` NEW authors
+            # left after the exclude filter.
+            exhausted=len(available) <= count,
         )
 
 
@@ -397,10 +403,11 @@ class _BatchDiscovery:
 
     `batches` is an ordered list where each element is the list of slugs that
     pass surfaces. A batch may contain slugs that won't qualify in matching
-    (an "empty" top-up batch) or `[]` to simulate genuine field exhaustion.
-    Once `batches` is exhausted, every further call returns `[]`. Slugs are
-    NOT re-filtered against `exclude_ids` — the script controls novelty — but
-    `exclude_ids` is still recorded for assertions.
+    (an "empty" top-up batch). Once `batches` is exhausted, every further call
+    returns `[]`. Slugs are NOT re-filtered against `exclude_ids` — the script
+    controls novelty — but `exclude_ids` is still recorded for assertions. These
+    scenarios drive termination via the empty-batch streak, NOT via field
+    exhaustion, so every pass reports `exhausted=False`.
     """
 
     def __init__(self, batches: list[list[str]]):
@@ -422,7 +429,9 @@ class _BatchDiscovery:
         slugs = self.batches[idx] if idx < len(self.batches) else []
         cands = [_candidate(s) for s in slugs]
         return discovery.DiscoveryResult(
-            professors=cands, attempted_ids={c.openalex_id for c in cands}
+            professors=cands,
+            attempted_ids={c.openalex_id for c in cands},
+            exhausted=False,
         )
 
 
@@ -553,11 +562,14 @@ class _ScriptedDiscovery:
       - `attempted`: every author this pass pulled+paid to enrich (survivors +
         email-less discards) → the DiscoveryResult's `attempted_ids`.
     A pass with `survivors=[]` but `attempted=[...]` models "pulled new authors
-    but all dropped at email validation" — NOT field exhaustion. A pass with
-    `attempted=[]` models genuine exhaustion (no new author surfaced at all).
-    Once the script is exhausted, every further call returns `([], [])`.
-    `exclude_ids` is recorded but does NOT re-filter — the script controls
-    novelty deterministically.
+    but all dropped at email validation" — NOT field exhaustion, so `exhausted`
+    is False and the loop keeps going. A pass with `attempted=[]` models genuine
+    exhaustion (OpenAlex paging surfaced no new author at all), so `exhausted` is
+    True and the loop stops. The fake derives `exhausted = not attempted`,
+    mirroring how the real `find_professors` reports exhaustion when its paged
+    pool comes back empty for a top-up. Once the script is exhausted, every
+    further call returns `([], [])` (→ exhausted=True). `exclude_ids` is recorded
+    but does NOT re-filter — the script controls novelty deterministically.
     """
 
     def __init__(self, script: list[tuple[list[str], list[str]]]):
@@ -581,7 +593,9 @@ class _ScriptedDiscovery:
         )
         cands = [_candidate(s) for s in survivors]
         return discovery.DiscoveryResult(
-            professors=cands, attempted_ids=set(attempted)
+            professors=cands,
+            attempted_ids=set(attempted),
+            exhausted=not attempted,
         )
 
 

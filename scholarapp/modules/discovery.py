@@ -53,6 +53,16 @@ MODEL_HAIKU = "claude-haiku-4-5"
 CONCURRENCY = 3
 OVERFETCH_MULTIPLIER = 3
 HTTP_TIMEOUT = 30.0
+# OpenAlex /authors page size when paging the candidate pool. The polite-pool
+# max is 200; we use it so we fill the over-fetch pool in as few requests as
+# possible (paging is free — only enrichment is paid).
+_AUTHORS_PER_PAGE = 200
+# Hard cap on how many OpenAlex /authors pages a single find_professors pass will
+# fetch while skipping excluded authors. Paging is free (no Tavily/Haiku), but we
+# bound it so a pathological field (huge exclude_ids, near-exhausted topic) can't
+# spin forever. Reaching this cap is NOT field exhaustion -> exhausted=False; the
+# CLI top-up loop's empty-batch streak / runaway guard handle the bounded case.
+_MAX_AUTHOR_PAGES = 10
 
 # Suffixes we accept as "academic email." Extend in docs/04-discovery.md.
 ACADEMIC_EMAIL_SUFFIXES: tuple[str, ...] = (
@@ -117,6 +127,12 @@ class ProfessorCandidate(BaseModel):
 class DiscoveryResult:
     professors: list[ProfessorCandidate]  # email-validated survivors, capped at `count`
     attempted_ids: set[str]  # short OpenAlex author IDs of EVERY author enriched this pass
+    # True ONLY when OpenAlex paging genuinely ran out of NEW (non-excluded)
+    # authors for the resolved topics — i.e. the field is exhausted. Reaching the
+    # bounded page cap (_MAX_AUTHOR_PAGES) before OpenAlex runs out is NOT
+    # exhaustion -> exhausted=False. The CLI top-up loop breaks on this flag; an
+    # empty `attempted_ids` with exhausted=False (e.g. count<=0) is not a stop.
+    exhausted: bool
 
 
 # Internal extraction schemas used as Anthropic tool input_schemas.
@@ -500,25 +516,85 @@ async def _resolve_topics(
     return chosen
 
 
+@dataclass(frozen=True)
+class _AuthorPool:
+    """Result of paging OpenAlex /authors while skipping excluded IDs.
+
+    `authors` is the NON-excluded candidate pool, capped at `target_count` (the
+    over-fetch size). `exhausted` is True only when OpenAlex genuinely ran out of
+    results for the topics before the pool filled — reaching the page cap is NOT
+    exhaustion.
+    """
+
+    authors: list[dict]
+    exhausted: bool
+
+
 async def _list_authors(
-    http: httpx.AsyncClient, topic_ids: list[str], target_count: int
-) -> list[dict]:
+    http: httpx.AsyncClient,
+    topic_ids: list[str],
+    target_count: int,
+    *,
+    exclude_ids: set[str] | None = None,
+) -> _AuthorPool:
+    """Page OpenAlex /authors (cursor paging), skipping `exclude_ids`, until the
+    over-fetch pool (`target_count` NEW authors) is filled, OpenAlex is exhausted,
+    or the hard page cap (`_MAX_AUTHOR_PAGES`) is reached.
+
+    Only OpenAlex paging happens here — it's free. No enrichment (Tavily/Haiku)
+    runs in this function, so deeper paging never increases cost. The returned
+    pool is bounded at `target_count` so the caller's enrichment budget is
+    unchanged from the pre-paging single-page behavior.
+
+    Returns an `_AuthorPool`. `exhausted=True` ONLY when OpenAlex returned no
+    further pages (genuine field exhaustion for these topics) before the pool was
+    filled. Hitting the page cap leaves `exhausted=False`.
+    """
+    exclude_ids = exclude_ids or set()
     topic_filter = "|".join(topic_ids)  # OR over topics
-    response = await _request_with_retry(
-        http,
-        "GET",
-        f"{OPENALEX_BASE}/authors",
-        params={
-            "filter": (
-                f"topics.id:{topic_filter},"
-                "last_known_institutions.type:education,"
-                "works_count:>10"
-            ),
-            "sort": "cited_by_count:desc",
-            "per_page": min(200, max(25, target_count)),
-        },
+    base_filter = (
+        f"topics.id:{topic_filter},"
+        "last_known_institutions.type:education,"
+        "works_count:>10"
     )
-    return response.json().get("results", [])[:target_count]
+
+    collected: list[dict] = []
+    cursor = "*"  # OpenAlex cursor-paging entrypoint
+    exhausted = False
+    for _page in range(_MAX_AUTHOR_PAGES):
+        response = await _request_with_retry(
+            http,
+            "GET",
+            f"{OPENALEX_BASE}/authors",
+            params={
+                "filter": base_filter,
+                "sort": "cited_by_count:desc",
+                "per_page": _AUTHORS_PER_PAGE,
+                "cursor": cursor,
+            },
+        )
+        body = response.json()
+        results = body.get("results", [])
+        for author in results:
+            if _short_id(author.get("id") or "") in exclude_ids:
+                continue
+            collected.append(author)
+            if len(collected) >= target_count:
+                # Pool is full; stop paging. NOT exhaustion — deeper authors may
+                # remain in OpenAlex, we just don't need them this pass.
+                return _AuthorPool(authors=collected[:target_count], exhausted=False)
+
+        next_cursor = (body.get("meta") or {}).get("next_cursor")
+        if not next_cursor or not results:
+            # OpenAlex handed back no further page (or an empty page): genuine
+            # exhaustion for these topics.
+            exhausted = True
+            break
+        cursor = next_cursor
+
+    # Fell out of the loop: either OpenAlex was exhausted (exhausted=True) or we
+    # hit the page cap with the pool still unfilled (exhausted=False).
+    return _AuthorPool(authors=collected[:target_count], exhausted=exhausted)
 
 
 def _filter_excluded(authors: list[dict], exclude_ids: set[str]) -> list[dict]:
@@ -639,24 +715,32 @@ async def find_professors(
     Returns a `DiscoveryResult` bundling the email-validated survivors
     (`professors`, capped at `count`) with `attempted_ids` — the short OpenAlex
     IDs of EVERY author this pass ran through enrichment (the full pool the
-    asyncio.gather enriched, survivors included). Every attempted author incurred
-    a paid Tavily search + Haiku extraction, so the CLI top-up loop excludes all
-    of them — not just survivors — to avoid re-pulling and re-paying for the same
-    top-cited authors that were dropped for lacking an email.
+    asyncio.gather enriched, survivors included) — and `exhausted`, True only when
+    OpenAlex paging genuinely ran out of NEW (non-excluded) authors for the
+    resolved topics. Every attempted author incurred a paid Tavily search + Haiku
+    extraction, so the CLI top-up loop excludes all of them — not just survivors —
+    to avoid re-pulling and re-paying for the same top-cited authors that were
+    dropped for lacking an email.
 
     `user_interests` is accepted for future use (e.g., narrowing the author pool)
     but not currently consulted — matching against interests happens in Step 5.
 
     `exclude_ids` holds short-form OpenAlex author IDs (same form as
     `ProfessorCandidate.openalex_id`) already discovered earlier in this run. They
-    are filtered out BEFORE enrichment so they cost no Tavily/Haiku, and the
-    OpenAlex fetch is sized up by `len(exclude_ids)` so that — after removing the
-    excluded top-cited authors — up to `count` NEW candidates can still surface.
-    A naive re-fetch would just return the same top-cited authors, so the top-up
-    loop in the CLI relies on this to make progress across passes.
+    are skipped DURING OpenAlex cursor-paging (in `_list_authors`) so they cost no
+    Tavily/Haiku and never enter the enriched pool. Because paging keeps fetching
+    deeper pages until it has collected `count * OVERFETCH_MULTIPLIER` NEW
+    candidates (or OpenAlex runs out, or the page cap is hit), a top-up pass keeps
+    making progress even when the exclude set has grown past the first page — which
+    a naive single-page fetch could not. Paging is free; only the bounded
+    over-fetch pool is enriched, so the paid budget is unchanged across passes.
+    `exhausted` distinguishes "OpenAlex truly has no more authors" (loop should
+    stop) from "we hit the bounded page cap" (loop may continue).
     """
     if count <= 0:
-        return DiscoveryResult(professors=[], attempted_ids=set())
+        # Nothing was requested, so nothing was fetched — this is not field
+        # exhaustion (no paging happened). exhausted=False.
+        return DiscoveryResult(professors=[], attempted_ids=set(), exhausted=False)
 
     exclude_ids = exclude_ids or set()
 
@@ -679,21 +763,46 @@ async def find_professors(
         )
         logger.info("Resolved field %r to topic ids %s", field, topic_ids)
 
-        # Over-fetch by OVERFETCH_MULTIPLIER (email resolution drops candidates)
-        # AND by len(exclude_ids) so the already-seen top-cited authors we'll drop
-        # don't eat into the `count` NEW candidates we still want this pass.
-        target_pool = (count + len(exclude_ids)) * OVERFETCH_MULTIPLIER
-        authors = await _list_authors(http, topic_ids, target_pool)
+        # Over-fetch by OVERFETCH_MULTIPLIER — email resolution drops candidates.
+        # The exclude-aware paging below skips already-seen authors as it goes, so
+        # the pool is `count` * OVERFETCH NEW (non-excluded) candidates. We no
+        # longer size the pool up by len(exclude_ids): paging skips excluded
+        # authors at the source instead of fetching then discarding them.
+        target_pool = count * OVERFETCH_MULTIPLIER
+
+        # Page OpenAlex, skipping exclude_ids, until the over-fetch pool is full,
+        # OpenAlex is exhausted, or the page cap is hit. Excluded authors are
+        # filtered DURING paging (free) so they never reach enrichment. Deeper
+        # paging is free; only the bounded `target_pool` pool is enriched, so the
+        # paid enrichment budget is unchanged from the old single-page behavior.
+        pool = await _list_authors(
+            http, topic_ids, target_pool, exclude_ids=exclude_ids
+        )
+        authors = pool.authors
+        openalex_exhausted = pool.exhausted
         if not authors:
+            if exclude_ids:
+                # Top-up pass: OpenAlex (after the exclude filter) surfaced no NEW
+                # author. Empty attempted_ids + exhausted lets the CLI loop stop on
+                # genuine field exhaustion without treating a bounded page cap the
+                # same way. Not raising keeps shortfall non-fatal (partial delivery).
+                logger.info(
+                    "No new authors for field %r after excluding %d seen IDs "
+                    "(exhausted=%s).",
+                    field,
+                    len(exclude_ids),
+                    openalex_exhausted,
+                )
+                return DiscoveryResult(
+                    professors=[], attempted_ids=set(), exhausted=openalex_exhausted
+                )
+            # Initial pass with nothing found at all: the topic is unusable. Keep
+            # the original fatal-on-error behavior for the initial pass.
             raise DiscoveryError(
                 f"OpenAlex returned no authors for field {field!r}. "
                 "The topic may be too narrow."
             )
         logger.info("OpenAlex returned %d candidate authors", len(authors))
-
-        # Filter out IDs already discovered earlier in this run BEFORE enrichment
-        # so excluded authors never trigger a paid Tavily search + Claude call.
-        authors = _filter_excluded(authors, exclude_ids)
 
         # Within-run dedup BEFORE enrichment: a professor that OpenAlex surfaces
         # more than once must be looked up at most once so we don't pay twice for
@@ -786,7 +895,11 @@ async def find_professors(
             count,
             len(final),
         )
-    return DiscoveryResult(professors=final[:count], attempted_ids=attempted_ids)
+    return DiscoveryResult(
+        professors=final[:count],
+        attempted_ids=attempted_ids,
+        exhausted=openalex_exhausted,
+    )
 
 
 def _pick_work_url(work: dict) -> str | None:

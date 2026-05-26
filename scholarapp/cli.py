@@ -193,16 +193,18 @@ def _discover_and_persist(
     count: int,
     interests: list[str],
     exclude_ids: set[str],
-) -> tuple[list[discovery.ProfessorCandidate], list[str], set[str]]:
+) -> tuple[list[discovery.ProfessorCandidate], list[str], set[str], bool]:
     """Discover `count` NEW professors (excluding `exclude_ids`) and persist them.
 
-    Returns `(candidates, new_professor_ids, attempted_ids)` so the caller can
-    report, grow `exclude_ids` by EVERY author this pass paid to enrich
-    (`attempted_ids`, not just the survivors), and match ONLY the newly persisted
-    professors. Excluding all attempted authors — including those dropped for
+    Returns `(candidates, new_professor_ids, attempted_ids, exhausted)` so the
+    caller can report, grow `exclude_ids` by EVERY author this pass paid to enrich
+    (`attempted_ids`, not just the survivors), match ONLY the newly persisted
+    professors, and learn whether OpenAlex genuinely ran out of new authors
+    (`exhausted`). Excluding all attempted authors — including those dropped for
     lacking an email — keeps later passes from re-pulling and re-paying for the
-    same top-cited people. Professors + their projects are written here; matching
-    happens separately.
+    same top-cited people. `exhausted` lets the top-up loop distinguish true field
+    exhaustion (stop) from a pass that merely surfaced no survivors (keep going).
+    Professors + their projects are written here; matching happens separately.
     """
     result = asyncio.run(
         discovery.find_professors(
@@ -236,7 +238,7 @@ def _discover_and_persist(
                     abstract=w.abstract,
                     raw_json={"openalex_id": w.openalex_id},
                 )
-    return candidates, new_professor_ids, result.attempted_ids
+    return candidates, new_professor_ids, result.attempted_ids, result.exhausted
 
 
 def _match_and_persist(
@@ -424,12 +426,14 @@ def run(
                 f"Discovering up to {count} professors in "
                 f"[italic]{field}[/italic]..."
             ):
-                candidates, new_prof_ids, attempted_ids = _discover_and_persist(
-                    run_id=run_id,
-                    field=field,
-                    count=count,
-                    interests=interests,
-                    exclude_ids=seen_openalex_ids,
+                candidates, new_prof_ids, attempted_ids, _exhausted = (
+                    _discover_and_persist(
+                        run_id=run_id,
+                        field=field,
+                        count=count,
+                        interests=interests,
+                        exclude_ids=seen_openalex_ids,
+                    )
                 )
         except ScholarError as e:
             with get_session() as session:
@@ -477,10 +481,13 @@ def run(
         # --- Top-up loop -------------------------------------------------------
         # Checkpoint AFTER matching, BEFORE drafting. Keep discovering+matching
         # NEW professors until we have `count` with a match, the field is
-        # exhausted (a pass surfaces zero new authors at all — empty
-        # attempted_ids), MAX_EMPTY_TOPUP_BATCHES consecutive passes add no new
-        # matched professor, or the runaway guard trips. None of these is fatal:
-        # on shortfall we deliver partially below.
+        # exhausted (discovery reports exhausted=True: OpenAlex paging ran out of
+        # NEW authors for the topics), MAX_EMPTY_TOPUP_BATCHES consecutive passes
+        # add no new matched professor, or the runaway guard trips. None of these
+        # is fatal: on shortfall we deliver partially below. Note: a pass that
+        # pulls authors but yields zero survivors is NOT exhaustion — discovery
+        # pages past the first OpenAlex page, so deeper ranks have been explored;
+        # such passes feed the empty-batch streak instead.
         # Mid-loop DiscoveryError/MatchingError break the loop quietly.
         passes = 1  # the initial pass above counts as pass 1
         empty_batches = 0  # consecutive top-up passes that added no new match
@@ -497,6 +504,9 @@ def run(
 
             shortfall = count - have
             passes += 1
+            # `have` at the START of this pass — the progress check below compares
+            # the post-match count against this to decide if the pass advanced.
+            have_before_pass = have
             ui.info(
                 f"[dim]Top-up pass {passes}: discovering {shortfall} more "
                 f"professor(s) ({have}/{count} so far)...[/dim]"
@@ -507,14 +517,17 @@ def run(
                     f"Discovering {shortfall} more professors in "
                     f"[italic]{field}[/italic]..."
                 ):
-                    topup_candidates, topup_prof_ids, topup_attempted_ids = (
-                        _discover_and_persist(
-                            run_id=run_id,
-                            field=field,
-                            count=shortfall,
-                            interests=interests,
-                            exclude_ids=seen_openalex_ids,
-                        )
+                    (
+                        topup_candidates,
+                        topup_prof_ids,
+                        topup_attempted_ids,
+                        topup_exhausted,
+                    ) = _discover_and_persist(
+                        run_id=run_id,
+                        field=field,
+                        count=shortfall,
+                        interests=interests,
+                        exclude_ids=seen_openalex_ids,
                     )
             except (DiscoveryError, MatchingError) as e:
                 # Mid-loop error: break (do NOT mark FAILED / re-raise here). The
@@ -523,25 +536,18 @@ def run(
                 break
 
             # Grow exclude by EVERY author this pass paid to enrich (survivors +
-            # discards) BEFORE the field-exhaustion check — even a pass that
-            # surfaces no email-validated survivor still paid for its pool, and
-            # the next pass must not re-pull it.
+            # discards) — even a pass that surfaces no email-validated survivor
+            # still paid for its pool, and the next pass must not re-pull it.
             seen_openalex_ids.update(topup_attempted_ids)
 
-            if not topup_attempted_ids:
-                # Genuine field exhaustion — discovery surfaced NO new authors at
-                # all this pass (nothing pulled, nothing paid for). Stop. A pass
-                # that DID pull authors but had them all dropped at email
-                # validation is NOT exhaustion: it has explored deeper ranks and
-                # is handled by the empty-batch streak below.
-                ui.info("[dim]No new professors available — field exhausted.[/dim]")
-                break
-
-            # New authors were pulled this pass. Match only the newly-persisted
-            # professors. If every pulled author was dropped at email validation
-            # (no new professor persisted), skip the match step entirely — there
-            # is nothing to match — and let the non-productive-pass logic below
-            # count this toward the empty-batch streak.
+            # Match this pass's newly-persisted professors FIRST, before deciding
+            # whether to stop. A pass that exhausts OpenAlex can STILL return
+            # matchable survivors (the final page that drains the pool), so we must
+            # count them before honoring the exhaustion stop below — otherwise the
+            # last pass's professors would be discovered, persisted, and then
+            # dropped from the delivered count. If every pulled author was dropped
+            # at email validation (no new professor persisted) the match step is
+            # skipped — there is nothing to match.
             if topup_prof_ids:
                 ui.professors_table(topup_candidates)
                 try:
@@ -558,10 +564,24 @@ def run(
                     break
 
             new_have = _count_professors_with_matches(run_id)
-            if new_have > have:
+            have = new_have
+
+            if topup_exhausted:
+                # Genuine field exhaustion — OpenAlex paging ran out of NEW
+                # (non-excluded) authors for the resolved topics this pass. We've
+                # already matched whatever this final pass surfaced (updating
+                # `have` above); there is nothing deeper to discover, so stop.
+                # Discovery now pages past the first OpenAlex page, so an
+                # empty/zero-survivor batch is NOT exhaustion by itself: only this
+                # flag is. A pass that pulled authors but dropped them all at email
+                # validation has explored deeper ranks (exhausted=False) and is
+                # handled by the empty-batch streak below.
+                ui.info("[dim]No new professors available — field exhausted.[/dim]")
+                break
+
+            if new_have > have_before_pass:
                 # Progress: this pass added at least one newly matched professor.
                 # Reset the empty-batch streak.
-                have = new_have
                 empty_batches = 0
                 continue
 
@@ -571,7 +591,6 @@ def run(
             # project. Both causes are treated UNIFORMLY — each counts one toward
             # the same consecutive-empty streak; only stop once the streak reaches
             # MAX_EMPTY_TOPUP_BATCHES.
-            have = new_have
             empty_batches += 1
             if empty_batches >= MAX_EMPTY_TOPUP_BATCHES:
                 ui.info(
