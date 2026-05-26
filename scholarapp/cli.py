@@ -14,6 +14,7 @@ import asyncio
 import enum
 import hashlib
 import logging
+import math
 import os
 import shutil
 import subprocess
@@ -29,6 +30,7 @@ from scholarapp.db import repo
 from scholarapp.db.models import DraftStatus, Project, RunStatus
 from scholarapp.db.session import get_session
 from scholarapp.errors import (
+    ConfigError,
     DiscoveryError,
     IngestionError,
     MatchingError,
@@ -535,6 +537,27 @@ def run(
         # purely informational). This single value drives BOTH the refuse-to-start
         # check and every mid-run boundary check below.
         effective_budget = budget if budget is not None else settings.run_max_usd
+
+        # Validate the resolved ceiling at the single point where both channels
+        # converge, so --budget and RUN_MAX_USD are policed identically regardless
+        # of source. A malformed ceiling is fail-closed: we hard-stop rather than
+        # silently fall back to "no ceiling" (which would defeat a cost guard the
+        # user explicitly set). None stays unbounded; 0 is a legitimate ceiling and
+        # is NOT rejected here — it naturally trips the refuse-to-start check below
+        # since estimate.total_usd > 0. We reject only non-finite (NaN/±inf, which
+        # math.isfinite catches) and negative values, which can't be real budgets.
+        # config.py's _env_float deliberately does NOT raise on these so unrelated
+        # commands (list, init) that load_settings() don't crash on a bad env value;
+        # the policy lives here, gating only the spending path. ConfigError is the
+        # existing error model — _run_safely renders it as ui.error + Exit(1).
+        if effective_budget is not None and (
+            not math.isfinite(effective_budget) or effective_budget < 0
+        ):
+            source = "--budget" if budget is not None else "RUN_MAX_USD"
+            raise ConfigError(
+                f"Invalid budget ceiling {source}={effective_budget!r}: must be a "
+                "finite, non-negative dollar amount."
+            )
 
         # Refuse-to-start: a ceiling below the projected total means the run can't
         # plausibly finish within budget, so we don't even discover. ui.error +

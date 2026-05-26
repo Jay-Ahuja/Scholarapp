@@ -1065,6 +1065,143 @@ def test_budget_overrides_run_max_usd(e2e_setup, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Malformed budget ceilings: non-finite (NaN/±inf) and negative are rejected
+# identically whether they arrive via --budget or RUN_MAX_USD. A rejection is a
+# fail-closed hard-stop: clean error, exit 1, and NOTHING past parse runs (no
+# discovery, no drafts, no RunUsage row).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("bad", ["nan", "inf", "-inf", "-5"])
+def test_malformed_budget_flag_hard_stops(e2e_setup, monkeypatch, bad):
+    """--budget {nan,inf,-inf,-5} hard-stops before any paid work."""
+    inputs = e2e_setup["inputs"]
+    fake_disc, _, fake_draft = _install_fakes(
+        monkeypatch, count=3, pool=["a", "b", "c"], qualifying={"a", "b", "c"}
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["run", "--inputs", str(inputs), "--budget", bad, "--yes"]
+    )
+
+    assert result.exit_code == 1, result.output
+    # The error names the malformed value and the source knob, and is NOT the
+    # refuse-to-start ("exceeds the budget") message — this is a validation stop.
+    assert "Invalid budget ceiling" in result.output
+    assert "--budget" in result.output
+    assert "exceeds the budget" not in result.output
+    # Nothing past parse ran: the gate sits before discovery/drafting.
+    assert fake_disc.calls == []
+    assert fake_draft.request_counts == []
+
+    with get_session() as session:
+        run = _the_run(session)
+        assert repo.list_drafts_for_run(session, run.id) == []
+        assert repo.list_recent_run_usage(session) == []
+
+
+@pytest.mark.parametrize("bad", ["nan", "inf", "-inf", "-5"])
+def test_malformed_run_max_usd_hard_stops(e2e_setup, monkeypatch, bad):
+    """RUN_MAX_USD {nan,inf,-inf,-5} hard-stops identically to --budget."""
+    inputs = e2e_setup["inputs"]
+    fake_disc, _, fake_draft = _install_fakes(
+        monkeypatch, count=3, pool=["a", "b", "c"], qualifying={"a", "b", "c"}
+    )
+    monkeypatch.setenv("RUN_MAX_USD", bad)
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["run", "--inputs", str(inputs), "--yes"])
+
+    assert result.exit_code == 1, result.output
+    # Same validation message, but the source knob is now the env var, proving the
+    # single convergence-point check polices both channels the same way.
+    assert "Invalid budget ceiling" in result.output
+    assert "RUN_MAX_USD" in result.output
+    assert "exceeds the budget" not in result.output
+    assert fake_disc.calls == []
+    assert fake_draft.request_counts == []
+
+    with get_session() as session:
+        run = _the_run(session)
+        assert repo.list_drafts_for_run(session, run.id) == []
+        assert repo.list_recent_run_usage(session) == []
+
+
+def test_zero_budget_flag_is_valid_and_refuses_to_start(e2e_setup, monkeypatch):
+    """--budget 0 is a legitimate ceiling: it refuses to run, NOT a validation error.
+
+    A zero ceiling is below any positive estimate, so it trips the existing
+    refuse-to-start check ("exceeds the budget") — it must NOT be treated as
+    malformed input.
+    """
+    inputs = e2e_setup["inputs"]
+    fake_disc, _, _ = _install_fakes(
+        monkeypatch, count=3, pool=["a", "b", "c"], qualifying={"a", "b", "c"}
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["run", "--inputs", str(inputs), "--budget", "0", "--yes"]
+    )
+
+    assert result.exit_code == 1, result.output
+    assert "exceeds the budget" in result.output
+    assert "Invalid budget ceiling" not in result.output
+    assert fake_disc.calls == []
+
+
+def test_zero_run_max_usd_is_valid_and_refuses_to_start(e2e_setup, monkeypatch):
+    """RUN_MAX_USD=0 is a legitimate ceiling that refuses to run (not malformed)."""
+    inputs = e2e_setup["inputs"]
+    fake_disc, _, _ = _install_fakes(
+        monkeypatch, count=3, pool=["a", "b", "c"], qualifying={"a", "b", "c"}
+    )
+    monkeypatch.setenv("RUN_MAX_USD", "0")
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["run", "--inputs", str(inputs), "--yes"])
+
+    assert result.exit_code == 1, result.output
+    assert "exceeds the budget" in result.output
+    assert "Invalid budget ceiling" not in result.output
+    assert fake_disc.calls == []
+
+
+def test_unset_budget_runs_unbounded(e2e_setup, monkeypatch):
+    """No --budget and no RUN_MAX_USD ⇒ effective_budget is None ⇒ unbounded run."""
+    inputs = e2e_setup["inputs"]
+    monkeypatch.delenv("RUN_MAX_USD", raising=False)
+    _, _, fake_draft = _install_fakes(
+        monkeypatch, count=2, pool=["a", "b"], qualifying={"a", "b"}
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["run", "--inputs", str(inputs), "--yes"])
+
+    assert result.exit_code == 0, result.output
+    assert "Invalid budget ceiling" not in result.output
+    assert fake_draft.request_counts == [2]
+
+
+def test_valid_positive_budget_runs_as_before(e2e_setup, monkeypatch):
+    """A generous finite, positive --budget is accepted and the run completes."""
+    inputs = e2e_setup["inputs"]
+    _, _, fake_draft = _install_fakes(
+        monkeypatch, count=2, pool=["a", "b"], qualifying={"a", "b"}
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["run", "--inputs", str(inputs), "--budget", "100", "--yes"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Invalid budget ceiling" not in result.output
+    assert fake_draft.request_counts == [2]
+
+
+# ---------------------------------------------------------------------------
 # Mid-run ceiling crossed → partial delivery + budget-named summary
 # ---------------------------------------------------------------------------
 
