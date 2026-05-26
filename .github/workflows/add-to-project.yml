@@ -1,0 +1,27 @@
+name: Add issues to project
+
+# Automatically adds every newly opened (or reopened) issue to the
+# "Scholarapp Roadmap" project board: https://github.com/users/Jay-Ahuja/projects/2
+#
+# Requires a repo secret `ADD_TO_PROJECT_PAT` — a Personal Access Token with
+# write access to the project. The default GITHUB_TOKEN cannot modify a
+# user-owned Projects (v2) board, so a PAT is mandatory:
+#   - Classic PAT: scopes `project` + `repo`
+#   - Fine-grained PAT: "Projects" read/write + repo "Issues" read
+# Add it under: repo → Settings → Secrets and variables → Actions → New secret.
+
+on:
+  issues:
+    types: [opened, reopened]
+
+permissions: {}
+
+jobs:
+  add-to-project:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Add issue to the Scholarapp Roadmap board
+        uses: actions/add-to-project@v1.0.2
+        with:
+          project-url: https://github.com/users/Jay-Ahuja/projects/2
+          github-token: ${{ secrets.ADD_TO_PROJECT_PAT }}
