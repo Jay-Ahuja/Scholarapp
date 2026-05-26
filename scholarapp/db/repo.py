@@ -24,6 +24,7 @@ from scholarapp.db.models import (
     ResumeCache,
     Run,
     RunStatus,
+    RunUsage,
     SendLog,
     SendOutcome,
 )
@@ -269,3 +270,33 @@ def get_cached_resume(session: Session, sha256: str) -> dict | None:
 def cache_resume(session: Session, sha256: str, parsed_json: dict) -> None:
     """Insert-or-replace the parsed resume keyed by content hash."""
     session.merge(ResumeCache(sha256=sha256, parsed_json=parsed_json))
+
+
+# ---------------------------------------------------------------------------
+# RunUsage — realized per-run cost, used as cost-estimation history
+# ---------------------------------------------------------------------------
+
+
+def add_run_usage(
+    session: Session,
+    *,
+    run_id: str,
+    count: int,
+    total_usd: float,
+    stage_costs: dict[str, float],
+) -> RunUsage:
+    usage = RunUsage(
+        run_id=run_id,
+        count=count,
+        total_usd=total_usd,
+        stage_costs=stage_costs,
+    )
+    session.add(usage)
+    session.flush()
+    return usage
+
+
+def list_recent_run_usage(session: Session, *, limit: int = 20) -> list[RunUsage]:
+    """Newest first. Caller feeds these into the cost estimator as history."""
+    stmt = select(RunUsage).order_by(RunUsage.created_at.desc()).limit(limit)
+    return list(session.scalars(stmt))

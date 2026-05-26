@@ -4,14 +4,19 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from scholarapp import usage as usage_tracker
 from scholarapp.usage import (
     PRICING,
+    STAGES,
     UNPRICED_MARKER,
     CallRecord,
+    CostEstimate,
+    RunCostSample,
+    StageEstimate,
     UsageTracker,
+    estimate_run_cost,
     record,
     set_tracker,
+    stage_costs_from_tracker,
     summarize,
 )
 
@@ -202,3 +207,155 @@ def test_set_tracker_isolates_contexts():
     assert tracker_a.records[0].label == "x"
     assert len(tracker_b.records) == 1
     assert tracker_b.records[0].label == "y"
+
+
+# ---------------------------------------------------------------------------
+# stage_costs_from_tracker
+# ---------------------------------------------------------------------------
+
+
+def test_stage_costs_always_has_every_stage_key():
+    out = stage_costs_from_tracker(UsageTracker())
+    assert set(out.keys()) == set(STAGES)
+    assert all(v == 0.0 for v in out.values())
+
+
+def test_stage_costs_maps_labels_to_stages():
+    tracker = UsageTracker()
+    tracker.record("pick_topics", "claude-haiku-4-5", _u(input_tokens=1000, output_tokens=100))
+    tracker.record("extract_email", "claude-haiku-4-5", _u(input_tokens=2000, output_tokens=200))
+    tracker.record("match_projects", "claude-haiku-4-5", _u(input_tokens=4000, output_tokens=400))
+    tracker.record("draft_email", "claude-sonnet-4-6", _u(input_tokens=3000, output_tokens=600))
+
+    out = stage_costs_from_tracker(tracker)
+
+    # discovery = pick_topics + extract_email (both haiku).
+    pick = 1000 * 1.0e-6 + 100 * 5.0e-6
+    extract = 2000 * 1.0e-6 + 200 * 5.0e-6
+    assert abs(out["discovery"] - (pick + extract)) < 1e-12
+    # matching = match_projects (haiku).
+    assert abs(out["matching"] - (4000 * 1.0e-6 + 400 * 5.0e-6)) < 1e-12
+    # drafting = draft_email (sonnet).
+    assert abs(out["drafting"] - (3000 * 3.0e-6 + 600 * 15.0e-6)) < 1e-12
+
+
+def test_stage_costs_ignores_unmapped_labels():
+    tracker = UsageTracker()
+    # parse_resume / parse_prompt belong to no stage — must not appear anywhere.
+    tracker.record("parse_resume", "claude-sonnet-4-6", _u(input_tokens=5000, output_tokens=500))
+    tracker.record("parse_prompt", "claude-haiku-4-5", _u(input_tokens=1000, output_tokens=100))
+    out = stage_costs_from_tracker(tracker)
+    assert all(v == 0.0 for v in out.values())
+
+
+# ---------------------------------------------------------------------------
+# estimate_run_cost — static fallback
+# ---------------------------------------------------------------------------
+
+
+def test_estimate_static_when_no_history():
+    est = estimate_run_cost(20, [])
+    assert est.basis == "static"
+    assert est.sample_size == 0
+    assert est.count == 20
+    # One stage entry per STAGES key, in order.
+    assert [s.stage for s in est.stages] == list(STAGES)
+    # Total invariant.
+    assert abs(est.total_usd - sum(s.cost_usd for s in est.stages)) < 1e-12
+    assert est.total_usd > 0
+
+
+def test_estimate_static_when_history_none():
+    est = estimate_run_cost(5, None)
+    assert est.basis == "static"
+    assert est.sample_size == 0
+
+
+def test_estimate_static_scales_with_count():
+    small = estimate_run_cost(1)
+    big = estimate_run_cost(10)
+    assert big.total_usd > small.total_usd
+
+
+def test_estimate_static_below_min_samples_stays_static():
+    # Two samples is below the threshold -> still static.
+    history = [
+        RunCostSample(count=10, stage_costs={s: 1.0 for s in STAGES}) for _ in range(2)
+    ]
+    est = estimate_run_cost(10, history)
+    assert est.basis == "static"
+    assert est.sample_size == 0
+
+
+def test_estimate_zero_count_is_nonnegative_static():
+    est = estimate_run_cost(0, [])
+    assert est.basis == "static"
+    assert all(s.cost_usd >= 0 for s in est.stages)
+    assert est.total_usd >= 0
+
+
+# ---------------------------------------------------------------------------
+# estimate_run_cost — historical averaging
+# ---------------------------------------------------------------------------
+
+
+def test_estimate_historical_when_enough_samples():
+    # Three runs of 10 profs each, $1 total per stage -> $0.10/prof/stage.
+    history = [
+        RunCostSample(count=10, stage_costs={s: 1.0 for s in STAGES}) for _ in range(3)
+    ]
+    est = estimate_run_cost(10, history)
+    assert est.basis == "historical"
+    assert est.sample_size == 3
+    # 10 profs * $0.10/prof/stage = $1.00 per stage.
+    for s in est.stages:
+        assert abs(s.cost_usd - 1.0) < 1e-12
+    assert abs(est.total_usd - sum(s.cost_usd for s in est.stages)) < 1e-12
+
+
+def test_estimate_historical_pools_totals_weighting_larger_runs():
+    # Pooled rate = total cost / total profs, NOT mean of per-run rates.
+    # Run A: 1 prof, $1 drafting -> 1.0/prof. Run B+C: 9 profs, $9 -> 1.0/prof.
+    history = [
+        RunCostSample(count=1, stage_costs={"discovery": 0.0, "matching": 0.0, "drafting": 1.0}),
+        RunCostSample(count=9, stage_costs={"discovery": 0.0, "matching": 0.0, "drafting": 9.0}),
+        RunCostSample(count=5, stage_costs={"discovery": 0.0, "matching": 0.0, "drafting": 5.0}),
+    ]
+    est = estimate_run_cost(3, history)
+    assert est.basis == "historical"
+    # pooled drafting rate = (1+9+5)/(1+9+5) = 1.0/prof -> 3 profs = $3.
+    drafting = next(s for s in est.stages if s.stage == "drafting")
+    assert abs(drafting.cost_usd - 3.0) < 1e-12
+
+
+def test_estimate_skips_zero_count_samples():
+    # Two real samples + one zero-count sample = only 2 usable -> below threshold.
+    history = [
+        RunCostSample(count=10, stage_costs={s: 1.0 for s in STAGES}),
+        RunCostSample(count=10, stage_costs={s: 1.0 for s in STAGES}),
+        RunCostSample(count=0, stage_costs={s: 999.0 for s in STAGES}),
+    ]
+    est = estimate_run_cost(10, history)
+    # The zero-count sample is dropped, leaving 2 usable -> static fallback, no div-by-zero.
+    assert est.basis == "static"
+
+
+def test_estimate_historical_count_zero_is_zero():
+    history = [
+        RunCostSample(count=10, stage_costs={s: 1.0 for s in STAGES}) for _ in range(3)
+    ]
+    est = estimate_run_cost(0, history)
+    assert est.basis == "historical"
+    assert est.total_usd == 0.0
+
+
+def test_dataclasses_are_frozen():
+    se = StageEstimate(stage="discovery", cost_usd=1.0)
+    ce = CostEstimate(count=1, total_usd=1.0, stages=[se], basis="static", sample_size=0)
+    for obj, attr in ((se, "cost_usd"), (ce, "total_usd")):
+        try:
+            setattr(obj, attr, 2.0)
+        except AttributeError:
+            pass
+        else:  # pragma: no cover - frozen dataclass should not allow this
+            raise AssertionError("expected frozen dataclass")

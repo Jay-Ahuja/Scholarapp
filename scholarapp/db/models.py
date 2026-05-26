@@ -182,6 +182,30 @@ class SendLog(Base):
     gmail_message_id: Mapped[str | None]
 
 
+class RunUsage(Base):
+    """Realized per-run cost, written once a run finishes (Step: cost accounting).
+
+    A SEPARATE table — not extra columns on `runs` — because the project has no
+    migrations: db/session.py's idempotent create_all() adds missing tables but
+    cannot ALTER an existing one. Decoupling also keeps a run's input metadata
+    (runs) distinct from its measured spend, and lets the cost engine average a
+    fresh history without touching the core pipeline schema.
+
+    `stage_costs` is a JSON object keyed by usage.STAGES so the cost engine can
+    average per-stage history. `total_usd` is stored denormalized for cheap
+    newest-first listing without re-summing the JSON in SQL.
+    """
+
+    __tablename__ = "run_usage"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    run_id: Mapped[str] = mapped_column(ForeignKey("runs.id"), index=True)
+    created_at: Mapped[datetime] = mapped_column(default=_utcnow)
+    count: Mapped[int]
+    total_usd: Mapped[float]
+    stage_costs: Mapped[dict] = mapped_column(JSON)
+
+
 class ResumeCache(Base):
     """Content-hash cache for parsed resumes.
 

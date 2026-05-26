@@ -169,3 +169,33 @@ def test_attach_resume_rejects_bad_state(tmp_path, monkeypatch):
     runner = CliRunner()
     result = runner.invoke(app, ["attach-resume", "maybe"])
     assert result.exit_code != 0
+
+
+# ---------------------------------------------------------------------------
+# RUN_MAX_USD — optional per-run spend ceiling (None => no ceiling)
+# ---------------------------------------------------------------------------
+
+
+def test_run_max_usd_unset_is_none(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.delenv("RUN_MAX_USD", raising=False)
+    assert load_settings().run_max_usd is None
+
+
+def test_run_max_usd_blank_is_none(tmp_path, monkeypatch):
+    """An empty/whitespace value is treated as unset, not 0.0."""
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("RUN_MAX_USD", "   ")
+    assert load_settings().run_max_usd is None
+
+
+def test_run_max_usd_parses_float(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("RUN_MAX_USD", "2.50")
+    assert load_settings().run_max_usd == 2.50
+
+
+def test_run_max_usd_parses_integer_string(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("RUN_MAX_USD", "5")
+    assert load_settings().run_max_usd == 5.0
