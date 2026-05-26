@@ -225,6 +225,13 @@ hit Tavily 429, discovery aborts immediately with a clean error — there's no
 in-run retry because monthly quotas don't recover in seconds. See
 [docs/04-discovery.md](04-discovery.md).
 
+**Platform note (Windows):** the CLI selects the selector asyncio event-loop
+policy at startup. On Windows the default proactor loop can fire a spurious
+"Event loop is closed" traceback during async HTTP-client teardown *after* a
+successful run completes; the selector loop sidesteps that shutdown race. It's a
+no-op off Windows and changes no behavior or concurrency — the same coroutines run
+under the same `ANTHROPIC_CONCURRENCY` bound.
+
 ## Cheap exploration: `scholar run --stop-after`
 
 `scholar run` accepts a `--stop-after {parse,discovery,matching}` flag that halts
@@ -324,7 +331,11 @@ installed (i.e., during unit tests that don't care).
 
 Pricing table lives at `scholarapp.usage.PRICING`. Update if Anthropic publishes
 new rates; the figures are estimates, not ground truth. The Anthropic console is
-the authoritative source for billing.
+the authoritative source for billing. If a call's model id isn't in `PRICING`, the
+summary flags that row as `unpriced` (the `UNPRICED_MARKER`) instead of showing
+`$0.00` — so a renamed or unrecognized model surfaces as visible unknown spend
+rather than being silently zero-costed, and the total notes that unpriced calls
+were excluded.
 
 If a row is missing from your summary, that call wasn't made (cache hit, branch
 short-circuit). For example, a re-run with the same resume PDF hits the resume
