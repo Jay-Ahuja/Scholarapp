@@ -356,6 +356,57 @@ def _count_professors_with_matches(run_id: str) -> int:
         )
 
 
+def _recent_cost_history() -> list[usage_tracker.RunCostSample]:
+    """Map persisted RunUsage rows into the estimator's RunCostSample inputs.
+
+    The cost engine is a pure function (no DB), so the CLI owns the ORM->sample
+    translation. We read newest-first via repo.list_recent_run_usage and project
+    each row onto (count, stage_costs); estimate_run_cost never raises on an empty
+    or short list, so a first-ever run (no history) cleanly falls back to its
+    static guess. Read inside its own session so nothing leaks past the boundary.
+    """
+    with get_session() as session:
+        rows = repo.list_recent_run_usage(session)
+        # Materialize the JSON dict fully inside the session — the row's
+        # stage_costs is a plain dict already, but copying keeps us detachment-safe.
+        return [
+            usage_tracker.RunCostSample(count=row.count, stage_costs=dict(row.stage_costs))
+            for row in rows
+        ]
+
+
+def _over_budget(effective_budget: float | None, tracker: usage_tracker.UsageTracker) -> bool:
+    """True once recorded spend has reached the ceiling (boundary check).
+
+    None means no ceiling. The comparison is `>=` so we stop at the boundary
+    rather than only after strictly exceeding it. This is best-effort: it gates
+    BETWEEN stages against already-recorded spend, so a single stage can overshoot
+    the ceiling internally — we never abort a Claude call mid-flight.
+    """
+    return effective_budget is not None and tracker.total_cost_usd >= effective_budget
+
+
+def _persist_run_usage(run_id: str, count: int, tracker: usage_tracker.UsageTracker) -> None:
+    """Write this run's realized per-stage cost as one RunUsage row (history).
+
+    Called once at each terminal path of the drafting phase, so a completed run —
+    full or partial — records exactly one row. `total_usd` is summed from the
+    per-stage costs (not tracker.total_cost_usd) so it stays consistent with the
+    stored stage_costs, which deliberately exclude one-off ingestion parsing.
+    Future runs feed these rows back through _recent_cost_history to sharpen the
+    estimate. Stage vocabulary is owned by usage.STAGES; we don't redefine it.
+    """
+    stage_costs = usage_tracker.stage_costs_from_tracker(tracker)
+    with get_session() as session:
+        repo.add_run_usage(
+            session,
+            run_id=run_id,
+            count=count,
+            total_usd=sum(stage_costs.values()),
+            stage_costs=stage_costs,
+        )
+
+
 @app.command("run")
 def run(
     inputs: Path = typer.Option(
@@ -369,10 +420,26 @@ def run(
         help="Stop the pipeline after this stage. Saves cost for cheap exploration.",
         case_sensitive=False,
     ),
+    budget: float | None = typer.Option(
+        None,
+        "--budget",
+        help="Hard USD ceiling for this run; stops cleanly before exceeding it.",
+    ),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        "-y",
+        help="Skip the pre-run cost-estimate confirmation prompt.",
+    ),
 ) -> None:
     "End-to-end: parse inputs, discover professors, match relevant works, draft " \
     "personalized emails. Drafts saved to the DB; `scholar review` writes them as " \
     "markdown for editing."
+
+    # Communicated out of the pipeline closure so the end-of-run summary (rendered
+    # in the finally below) can name a budget stop. A list cell avoids juggling a
+    # tuple across the pipeline's several early-return paths.
+    budget_stop: list[tuple[float, float]] = []
 
     def _impl() -> None:
         tracker = usage_tracker.UsageTracker()
@@ -385,6 +452,12 @@ def run(
                 ui.info("")
                 ui.section("Claude usage")
                 ui.render_usage_table(tracker)
+            # If the run stopped because it hit the ceiling, name the budget vs the
+            # spend right under the usage table. Rendered in the finally so it shows
+            # even on the partial-delivery path.
+            if budget_stop:
+                budget_usd, spent_usd = budget_stop[0]
+                ui.budget_stop_notice(budget_usd, spent_usd)
 
     def _run_pipeline(tracker: usage_tracker.UsageTracker) -> None:
         settings = load_settings()
@@ -449,73 +522,135 @@ def run(
         interests = resume_data.interests
         experiences_text = _summarize_experiences(resume_data.experiences)
 
+        # --- Cost estimate + budget gate ---------------------------------------
+        # Placed AFTER parse (count is known only once prompt.md is parsed) and
+        # BEFORE any paid discovery/matching/drafting, so a refusal or a decline
+        # spends nothing past the two cheap ingestion calls already made above.
+        ui.section("Cost estimate")
+        estimate = usage_tracker.estimate_run_cost(count, _recent_cost_history())
+        ui.cost_estimate_panel(estimate)
+
+        # An explicit --budget overrides the sticky RUN_MAX_USD setting; if neither
+        # is set, effective_budget is None and the run is unbounded (estimate is
+        # purely informational). This single value drives BOTH the refuse-to-start
+        # check and every mid-run boundary check below.
+        effective_budget = budget if budget is not None else settings.run_max_usd
+
+        # Refuse-to-start: a ceiling below the projected total means the run can't
+        # plausibly finish within budget, so we don't even discover. ui.error +
+        # exit(1) (no new exception type — the orchestrator's error model).
+        if effective_budget is not None and effective_budget < estimate.total_usd:
+            ui.error(
+                f"Estimated cost ${estimate.total_usd:.4f} exceeds the budget "
+                f"${effective_budget:.4f}. Raise --budget / RUN_MAX_USD, or lower "
+                "the requested professor count."
+            )
+            raise typer.Exit(code=1)
+
+        # Confirm (opt-out): only prompt on a real TTY and only when --yes wasn't
+        # passed. Non-interactive callers (CI, the test runner, piped input) proceed
+        # WITHOUT a prompt so they never hang — the budget still protects them.
+        if sys.stdin.isatty() and not yes:
+            if not typer.confirm(
+                f"Proceed with this run (estimated ${estimate.total_usd:.4f})?",
+                default=True,
+            ):
+                ui.info("Aborted.")
+                return
+
+        # Set once here; the mid-run budget checks flip it to "budget" so the
+        # end-of-run summary can name why a run stopped short.
+        stop_reason: str | None = None
+
+        # OpenAlex IDs seen this run — grows every pass so top-ups never re-pay
+        # for the same top-cited authors and OpenAlex returns NEW candidates.
+        seen_openalex_ids: set[str] = set()
+        # `have` is the count of professors with >=1 match; it stays 0 if the budget
+        # gate skips discovery/matching, in which case partial delivery drafts none.
+        have = 0
+
         # --- Discover ----------------------------------------------------------
         ui.section("Discover")
 
         with get_session() as session:
             repo.update_run_status(session, run_id, RunStatus.DISCOVERING)
 
-        # OpenAlex IDs seen this run — grows every pass so top-ups never re-pay
-        # for the same top-cited authors and OpenAlex returns NEW candidates.
-        seen_openalex_ids: set[str] = set()
+        # Pre-discovery boundary check: if prior recorded spend (the two ingestion
+        # calls) already met the ceiling, skip discovery+matching entirely and fall
+        # through to partial delivery (which drafts nothing — nothing matched yet).
+        if _over_budget(effective_budget, tracker):
+            stop_reason = "budget"
+            ui.warn("Budget reached before discovery — skipping discovery and matching.")
 
-        # Initial pass: discovery + matching keep today's fatal-on-error behavior.
-        try:
-            with ui.spinner(
-                f"Discovering up to {count} professors in "
-                f"[italic]{field}[/italic]..."
-            ):
-                candidates, new_prof_ids, attempted_ids, _exhausted = (
-                    _discover_and_persist(
-                        run_id=run_id,
-                        field=field,
-                        count=count,
-                        interests=interests,
-                        exclude_ids=seen_openalex_ids,
+        if stop_reason is None:
+            # Initial pass: discovery + matching keep today's fatal-on-error behavior.
+            try:
+                with ui.spinner(
+                    f"Discovering up to {count} professors in "
+                    f"[italic]{field}[/italic]..."
+                ):
+                    candidates, new_prof_ids, attempted_ids, _exhausted = (
+                        _discover_and_persist(
+                            run_id=run_id,
+                            field=field,
+                            count=count,
+                            interests=interests,
+                            exclude_ids=seen_openalex_ids,
+                        )
                     )
-                )
-        except ScholarError as e:
+            except ScholarError as e:
+                with get_session() as session:
+                    repo.update_run_status(
+                        session, run_id, RunStatus.FAILED, error=f"discovery failed: {e}"
+                    )
+                raise
+
+            # Exclude EVERY author this pass paid to enrich — survivors AND the
+            # email-less discards — so the first top-up advances to deeper ranks
+            # instead of re-pulling and re-paying for this pass's discards.
+            seen_openalex_ids.update(attempted_ids)
+            ui.professors_table(candidates)
+
             with get_session() as session:
-                repo.update_run_status(
-                    session, run_id, RunStatus.FAILED, error=f"discovery failed: {e}"
+                repo.update_run_status(session, run_id, RunStatus.MATCHING)
+
+            if stop_after == PipelineStage.discovery:
+                ui.info(
+                    "[dim]Stopped after discovery as requested (--stop-after discovery).[/dim]"
                 )
-            raise
+                return
 
-        # Exclude EVERY author this pass paid to enrich — survivors AND the
-        # email-less discards — so the first top-up advances to deeper ranks
-        # instead of re-pulling and re-paying for this pass's discards.
-        seen_openalex_ids.update(attempted_ids)
-        ui.professors_table(candidates)
+            # --- Match ---------------------------------------------------------
+            ui.section("Match")
 
-        with get_session() as session:
-            repo.update_run_status(session, run_id, RunStatus.MATCHING)
+            # Pre-matching boundary check: discovery may have pushed recorded spend
+            # to the ceiling. If so, skip matching (and the top-up loop) — partial
+            # delivery drafts the (zero) professors that have a completed match.
+            if _over_budget(effective_budget, tracker):
+                stop_reason = "budget"
+                ui.warn("Budget reached after discovery — skipping matching.")
+            else:
+                try:
+                    with ui.spinner(
+                        f"Matching projects for {len(new_prof_ids)} professors..."
+                    ):
+                        _match_and_persist(
+                            professor_ids=new_prof_ids,
+                            interests=interests,
+                            experiences_text=experiences_text,
+                        )
+                except ScholarError as e:
+                    with get_session() as session:
+                        repo.update_run_status(
+                            session, run_id, RunStatus.FAILED, error=f"matching failed: {e}"
+                        )
+                    raise
 
-        if stop_after == PipelineStage.discovery:
-            ui.info("[dim]Stopped after discovery as requested (--stop-after discovery).[/dim]")
-            return
-
-        # --- Match -------------------------------------------------------------
-        ui.section("Match")
-
-        try:
-            with ui.spinner(f"Matching projects for {len(new_prof_ids)} professors..."):
-                _match_and_persist(
-                    professor_ids=new_prof_ids,
-                    interests=interests,
-                    experiences_text=experiences_text,
+                have = _count_professors_with_matches(run_id)
+                ui.info(
+                    f"[green]✓[/green] {have} professor(s) with ≥1 matched project "
+                    f"(target {count})."
                 )
-        except ScholarError as e:
-            with get_session() as session:
-                repo.update_run_status(
-                    session, run_id, RunStatus.FAILED, error=f"matching failed: {e}"
-                )
-            raise
-
-        have = _count_professors_with_matches(run_id)
-        ui.info(
-            f"[green]✓[/green] {have} professor(s) with ≥1 matched project "
-            f"(target {count})."
-        )
 
         # --- Top-up loop -------------------------------------------------------
         # Checkpoint AFTER matching, BEFORE drafting. Keep discovering+matching
@@ -531,6 +666,20 @@ def run(
         passes = 1  # the initial pass above counts as pass 1
         empty_batches = 0  # consecutive top-up passes that added no new match
         while have < count:
+            # Budget boundary check BEFORE each top-up pass — alongside (not in
+            # place of) the existing terminations. If recorded spend has reached the
+            # ceiling, stop topping up and fall through to partial delivery with
+            # whatever already matched. Top-up termination semantics are otherwise
+            # untouched. Also catches the case where discovery/matching already set
+            # stop_reason: have is still 0 here, so we break out immediately.
+            if stop_reason == "budget" or _over_budget(effective_budget, tracker):
+                stop_reason = "budget"
+                ui.warn(
+                    f"Budget reached during top-up — stopping with {have} of {count} "
+                    "professors."
+                )
+                break
+
             if passes >= MAX_DISCOVERY_PASSES:
                 # Runaway guard. Should be unreachable in practice (the zero-new
                 # and empty-streak terminations fire first). Stop and fall
@@ -671,6 +820,16 @@ def run(
                 "with a matched project."
             )
 
+        # Pre-drafting boundary check. If recorded spend hit the ceiling during
+        # discovery/matching/top-up, note it so the end-of-run summary names the
+        # budget. Drafting still proceeds on the already-matched professors: that
+        # IS the partial-delivery path, and within-stage overshoot is accepted (we
+        # never abort a draft mid-flight). A run that reached the budget after a
+        # full discovery+match but before any top-up still delivers what matched.
+        if stop_reason != "budget" and _over_budget(effective_budget, tracker):
+            stop_reason = "budget"
+            ui.warn("Budget reached before drafting — drafting only what already matched.")
+
         with get_session() as session:
             repo.update_run_status(session, run_id, RunStatus.DRAFTING)
 
@@ -720,6 +879,11 @@ def run(
 
         if not draft_requests:
             ui.warn("No professors with matched projects — nothing to draft.")
+            # Still a completed run — record its (mostly ingestion/discovery) spend
+            # so it counts as history exactly once, like any other terminal path.
+            _persist_run_usage(run_id, count, tracker)
+            if stop_reason == "budget" and effective_budget is not None:
+                budget_stop.append((effective_budget, tracker.total_cost_usd))
             return
 
         try:
@@ -751,6 +915,13 @@ def run(
                     status=DraftStatus.PENDING_REVIEW,
                 )
             repo.update_run_status(session, run_id, RunStatus.REVIEW)
+
+        # Record realized cost once the run completes — this is the history that
+        # sharpens future estimates. Written here (not in a finally) so a failed/
+        # aborted/refused run leaves no misleading sample.
+        _persist_run_usage(run_id, count, tracker)
+        if stop_reason == "budget" and effective_budget is not None:
+            budget_stop.append((effective_budget, tracker.total_cost_usd))
 
         # --- Done --------------------------------------------------------------
         ui.section("Done")
