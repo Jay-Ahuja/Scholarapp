@@ -139,7 +139,7 @@ def summarize(tracker: UsageTracker) -> str:
         grouped.setdefault(r.label, []).append(r)
 
     rule = "─" * 64
-    lines: list[str] = [rule, f"  Claude usage", rule]
+    lines: list[str] = [rule, "  Claude usage", rule]
 
     total_cost = 0.0
     by_model_cost: dict[str, float] = {}
