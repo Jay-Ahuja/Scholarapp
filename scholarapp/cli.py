@@ -394,8 +394,17 @@ def _over_budget(effective_budget: float | None, tracker: usage_tracker.UsageTra
     rather than only after strictly exceeding it. This is best-effort: it gates
     BETWEEN stages against already-recorded spend, so a single stage can overshoot
     the ceiling internally — we never abort a Claude call mid-flight.
+
+    Fail-closed on unpriced spend: an unknown-model call costs $0.00 to
+    total_cost_usd only because we have no rate for it, NOT because it was free.
+    Under an active budget that unmeasurable spend is itself a stop condition, so
+    ANY unpriced call trips the gate regardless of how small recognized spend is.
+    The check stays BEHIND the `effective_budget is not None` gate so a no-budget
+    run is unaffected (unpriced spend only surfaces in the usage summary there).
     """
-    return effective_budget is not None and tracker.total_cost_usd >= effective_budget
+    return effective_budget is not None and (
+        tracker.total_cost_usd >= effective_budget or tracker.has_unpriced_calls
+    )
 
 
 def _persist_run_usage(
@@ -469,8 +478,10 @@ def run(
 
     # Communicated out of the pipeline closure so the end-of-run summary (rendered
     # in the finally below) can name a budget stop. A list cell avoids juggling a
-    # tuple across the pipeline's several early-return paths.
-    budget_stop: list[tuple[float, float]] = []
+    # tuple across the pipeline's several early-return paths. The third element
+    # records whether unpriced (unknown-model) spend was present at the stop, so
+    # the summary can name the fail-closed reason instead of the plain ceiling.
+    budget_stop: list[tuple[float, float, bool]] = []
 
     def _impl() -> None:
         tracker = usage_tracker.UsageTracker()
@@ -487,8 +498,8 @@ def run(
             # spend right under the usage table. Rendered in the finally so it shows
             # even on the partial-delivery path.
             if budget_stop:
-                budget_usd, spent_usd = budget_stop[0]
-                ui.budget_stop_notice(budget_usd, spent_usd)
+                budget_usd, spent_usd, unpriced = budget_stop[0]
+                ui.budget_stop_notice(budget_usd, spent_usd, unpriced=unpriced)
 
     def _run_pipeline(tracker: usage_tracker.UsageTracker) -> None:
         settings = load_settings()
@@ -936,7 +947,9 @@ def run(
             # Nothing was drafted, so the drafting stage's realized count is 0.
             _persist_run_usage(run_id, count, 0, tracker)
             if stop_reason == "budget" and effective_budget is not None:
-                budget_stop.append((effective_budget, tracker.total_cost_usd))
+                budget_stop.append(
+                    (effective_budget, tracker.total_cost_usd, tracker.has_unpriced_calls)
+                )
             return
 
         try:
@@ -976,7 +989,9 @@ def run(
         # drafts fewer than `count`).
         _persist_run_usage(run_id, count, len(email_drafts), tracker)
         if stop_reason == "budget" and effective_budget is not None:
-            budget_stop.append((effective_budget, tracker.total_cost_usd))
+            budget_stop.append(
+                (effective_budget, tracker.total_cost_usd, tracker.has_unpriced_calls)
+            )
 
         # --- Done --------------------------------------------------------------
         ui.section("Done")

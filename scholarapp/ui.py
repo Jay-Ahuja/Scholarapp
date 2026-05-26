@@ -345,14 +345,29 @@ def cost_estimate_panel(estimate: Any) -> None:
     console.print(basis_text)
 
 
-def budget_stop_notice(budget_usd: float, spent_usd: float) -> None:
+def budget_stop_notice(budget_usd: float, spent_usd: float, *, unpriced: bool = False) -> None:
     """Warn-style line shown with the end-of-run usage section when a run
     stopped because the budget ceiling was reached.
 
     Reuses the yellow `warning:` prefix from warn() for visual consistency, but
     names both the configured budget and the amount actually spent so the user
     can see how close the two are.
+
+    When `unpriced` is True the run stopped fail-closed: at least one call used a
+    model with no known rate, so its spend could NOT be measured against the
+    budget. That message takes precedence over the plain ceiling line because the
+    shown `spent_usd` covers only priced calls — it EXCLUDES the unaccountable
+    ones, so the true spend is higher than the figure displayed. `unpriced=False`
+    renders the original "budget reached" line unchanged.
     """
+    if unpriced:
+        console.print(
+            f"[yellow]warning:[/yellow] run stopped — unpriced spend: a call used a "
+            f"model with no known rate, so its cost could not be measured against the "
+            f"[bold]${budget_usd:.4f}[/bold] budget. Stopped fail-closed; the priced "
+            f"spend shown ([bold]${spent_usd:.4f}[/bold]) EXCLUDES the unaccountable call(s)."
+        )
+        return
     console.print(
         f"[yellow]warning:[/yellow] run stopped — budget reached: "
         f"spent [bold]${spent_usd:.4f}[/bold] of [bold]${budget_usd:.4f}[/bold] budget"

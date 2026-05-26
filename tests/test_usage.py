@@ -207,6 +207,25 @@ def test_summarize_empty_tracker():
     assert "no Claude calls" in out
 
 
+def test_has_unpriced_calls_false_for_all_known_models():
+    tracker = UsageTracker()
+    tracker.record("parse_resume", "claude-sonnet-4-6", _u(input_tokens=1000, output_tokens=500))
+    tracker.record("extract_email", "claude-haiku-4-5", _u(input_tokens=2000, output_tokens=200))
+    assert tracker.has_unpriced_calls is False
+
+
+def test_has_unpriced_calls_true_with_unknown_model():
+    tracker = UsageTracker()
+    tracker.record("parse_resume", "claude-sonnet-4-6", _u(input_tokens=1000, output_tokens=500))
+    # An unknown-model call has no rate: its $0.00 cost hides real spend.
+    tracker.record("mystery", "claude-bogus-9-9", _u(input_tokens=10000, output_tokens=1000))
+    assert tracker.has_unpriced_calls is True
+
+
+def test_has_unpriced_calls_false_for_empty_tracker():
+    assert UsageTracker().has_unpriced_calls is False
+
+
 def test_set_tracker_isolates_contexts():
     tracker_a = UsageTracker()
     tracker_b = UsageTracker()

@@ -1334,6 +1334,205 @@ def test_completed_run_writes_exactly_one_run_usage_row(e2e_setup, monkeypatch):
         assert counts == {"discovery": 2, "matching": 2, "drafting": 2}
 
 
+# ---------------------------------------------------------------------------
+# Fail-closed on unpriced (unknown-model) spend under a budget ceiling
+#
+# An unknown-model call costs $0.00 to total_cost_usd only because we have no
+# rate for it — NOT because it was free. Under an active budget that unmeasurable
+# spend is itself a stop condition (fail-closed), so the run must stop at the
+# next boundary even when recognized spend is tiny. With NO budget the unknown
+# model must NOT stop the run (it only surfaces in the usage summary).
+# ---------------------------------------------------------------------------
+
+
+def _record_unpriced(label: str, input_tokens: int) -> None:
+    """Record one UNKNOWN-model call against the CLI-installed tracker.
+
+    The model id is absent from PRICING, so the call is unpriced: it contributes
+    $0.00 to total_cost_usd but flips tracker.has_unpriced_calls to True.
+    """
+    from scholarapp import usage
+
+    usage.record(label, "claude-bogus-9-9", _Usage(input_tokens))
+
+
+class _UnpricedMatching(_FakeMatching):
+    """_FakeMatching that records an UNPRICED (unknown-model) matching call.
+
+    Matching still completes its matches (so a professor IS matched), but the
+    recorded spend is unmeasurable against any budget. The post-matching boundary
+    checks must fail closed regardless of recognized spend.
+    """
+
+    async def __call__(self, **kwargs: Any) -> list[list[matching.MatchedProject]]:
+        _record_unpriced("match_projects", 10_000)
+        return await super().__call__(**kwargs)
+
+
+class _UnpricedDiscovery(_FakeDiscovery):
+    """_FakeDiscovery that records an UNPRICED (unknown-model) discovery call.
+
+    Spend is unmeasurable against any budget, so the next boundary check must
+    fail closed and stop the run regardless of recognized spend.
+    """
+
+    async def __call__(self, **kwargs: Any) -> discovery.DiscoveryResult:
+        _record_unpriced("extract_email", 10_000)
+        return await super().__call__(**kwargs)
+
+
+def test_unpriced_spend_under_budget_stops_at_next_boundary(e2e_setup, monkeypatch):
+    """An unknown-model call under a generous budget stops the run fail-closed.
+
+    Matching records an UNPRICED call (cost $0.00) under a $100 budget — far above
+    any recognized spend — after matching the single professor `a`. The post-match
+    boundary checks must still trip on the unpriced spend and fall into partial
+    delivery (drafts the 1 matched professor, ends REVIEW), and the summary must
+    name the unaccountable spend.
+    """
+    inputs = e2e_setup["inputs"]
+    _mock_ingestion(monkeypatch, count=3)
+
+    # Initial pass matches only `a`; a top-up would normally follow, but the
+    # unpriced spend recorded during matching trips the budget gate first.
+    fake_disc = _FakeDiscovery(pool=["a", "b", "c", "d", "e"])
+    fake_match = _UnpricedMatching(qualifying={"a", "d", "e"})
+    fake_draft = _FakeDrafting()
+    monkeypatch.setattr(discovery, "find_professors", fake_disc)
+    monkeypatch.setattr(matching, "match_projects_for_run", fake_match)
+    monkeypatch.setattr(drafting, "draft_emails_for_run", fake_draft)
+
+    runner = CliRunner()
+    # $100 ceiling is never reached by recognized spend ($0.00 here); only the
+    # unpriced call trips the gate — proving fail-closed, not a ceiling crossing.
+    result = runner.invoke(
+        app, ["run", "--inputs", str(inputs), "--budget", "100", "--yes"]
+    )
+
+    assert result.exit_code == 0, result.output
+    # The gate tripped right after the initial match — no top-up pass ran.
+    assert len(fake_disc.calls) == 1
+    # Partial delivery drafted the single matched professor.
+    assert fake_draft.request_counts == [1]
+    # The end-of-run summary names the fail-closed unaccountable spend, and the
+    # plain "budget reached: spent ... of ... budget" summary line is NOT used
+    # (the unpriced message takes precedence). The mid-run top-up progress warning
+    # may still say "budget reached during top-up" — that's a separate notice.
+    assert "could not be measured" in result.output
+    assert "budget reached: spent" not in result.output.lower()
+
+    with get_session() as session:
+        run = _the_run(session)
+        # Partial delivery ends in the normal REVIEW state, not FAILED.
+        assert run.status == RunStatus.REVIEW
+        assert len(repo.list_drafts_for_run(session, run.id)) == 1
+
+
+def test_unpriced_spend_during_discovery_skips_matching_fail_closed(e2e_setup, monkeypatch):
+    """Unpriced spend recorded in DISCOVERY trips the pre-matching gate, drafts none.
+
+    Discovery records the unpriced call, so the pre-matching boundary check (after
+    discovery) fails closed before matching runs — nothing matches and partial
+    delivery drafts zero. A clean, non-FAILED run that names the unaccountable
+    spend.
+    """
+    inputs = e2e_setup["inputs"]
+    _mock_ingestion(monkeypatch, count=3)
+
+    fake_disc = _UnpricedDiscovery(pool=["a", "b", "c", "d", "e"])
+    fake_match = _FakeMatching(qualifying={"a", "d", "e"})
+    fake_draft = _FakeDrafting()
+    monkeypatch.setattr(discovery, "find_professors", fake_disc)
+    monkeypatch.setattr(matching, "match_projects_for_run", fake_match)
+    monkeypatch.setattr(drafting, "draft_emails_for_run", fake_draft)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["run", "--inputs", str(inputs), "--budget", "100", "--yes"]
+    )
+
+    assert result.exit_code == 0, result.output
+    # Matching was skipped (fail-closed before it ran), so nothing was drafted.
+    assert fake_match.matched_names == []
+    assert fake_draft.request_counts == []
+    # The post-discovery boundary check fired on the unpriced spend, skipping match.
+    assert "Budget reached after discovery" in result.output
+    # The end-of-run summary names the fail-closed unaccountable spend, not the
+    # plain ceiling line.
+    assert "could not be measured" in result.output
+    assert "budget reached: spent" not in result.output.lower()
+
+    with get_session() as session:
+        run = _the_run(session)
+        # A nothing-to-draft run is NOT a failure (it ends in the drafting phase's
+        # nothing-to-draft terminal path), but it must never be FAILED.
+        assert run.status != RunStatus.FAILED
+        assert repo.list_drafts_for_run(session, run.id) == []
+
+
+def test_unpriced_spend_with_no_budget_does_not_stop(e2e_setup, monkeypatch):
+    """No budget + an unknown-model call must NOT stop the run (gate stays off)."""
+    inputs = e2e_setup["inputs"]
+    monkeypatch.delenv("RUN_MAX_USD", raising=False)
+    _mock_ingestion(monkeypatch, count=2)
+
+    # Both professors qualify; the unpriced discovery call must not gate anything
+    # because there's no active budget.
+    fake_disc = _UnpricedDiscovery(pool=["a", "b"])
+    fake_match = _FakeMatching(qualifying={"a", "b"})
+    fake_draft = _FakeDrafting()
+    monkeypatch.setattr(discovery, "find_professors", fake_disc)
+    monkeypatch.setattr(matching, "match_projects_for_run", fake_match)
+    monkeypatch.setattr(drafting, "draft_emails_for_run", fake_draft)
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["run", "--inputs", str(inputs), "--yes"])
+
+    assert result.exit_code == 0, result.output
+    # No budget ⇒ unpriced spend never gates: the full run drafts both professors.
+    assert fake_draft.request_counts == [2]
+    # No budget-stop / fail-closed notice was emitted.
+    assert "could not be measured" not in result.output
+    assert "budget reached" not in result.output.lower()
+
+    with get_session() as session:
+        run = _the_run(session)
+        assert run.status == RunStatus.REVIEW
+        assert len(repo.list_drafts_for_run(session, run.id)) == 2
+
+
+def test_all_priced_under_budget_behaves_as_before(e2e_setup, monkeypatch):
+    """All-priced spend under a generous budget completes a full run unchanged.
+
+    A regression guard: introducing the unpriced trip must not alter the
+    all-known-model path. No fail-closed notice, full delivery, REVIEW status.
+    """
+    inputs = e2e_setup["inputs"]
+    _mock_ingestion(monkeypatch, count=2)
+
+    fake_disc = _CostingDiscovery(pool=["a", "b"], dollars_per_call=0.2)
+    fake_match = _CostingMatching(qualifying={"a", "b"}, dollars_per_call=0.3)
+    fake_draft = _CostingDrafting(dollars_per_call=0.4)
+    monkeypatch.setattr(discovery, "find_professors", fake_disc)
+    monkeypatch.setattr(matching, "match_projects_for_run", fake_match)
+    monkeypatch.setattr(drafting, "draft_emails_for_run", fake_draft)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["run", "--inputs", str(inputs), "--budget", "100", "--yes"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert fake_draft.request_counts == [2]
+    assert "could not be measured" not in result.output
+    assert "budget reached" not in result.output.lower()
+
+    with get_session() as session:
+        run = _the_run(session)
+        assert run.status == RunStatus.REVIEW
+        assert len(repo.list_drafts_for_run(session, run.id)) == 2
+
+
 def test_refused_run_writes_no_run_usage_row(e2e_setup, monkeypatch):
     """A refuse-to-start run leaves no RunUsage history sample behind."""
     inputs = e2e_setup["inputs"]

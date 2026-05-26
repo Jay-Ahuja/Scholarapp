@@ -271,6 +271,31 @@ def test_budget_stop_notice_names_budget_and_spent(capture):
     assert "$2.0000" in out
 
 
+def test_budget_stop_notice_priced_default_renders_plain_ceiling_line(capture):
+    # The default (unpriced=False) path must render exactly the plain ceiling line.
+    ui.budget_stop_notice(budget_usd=2.00, spent_usd=1.9876)
+    out = capture.export_text()
+    assert "budget reached" in out
+    # No fail-closed/unpriced phrasing leaks into the priced-case message.
+    assert "could not be measured" not in out
+    assert "EXCLUDES" not in out
+
+
+def test_budget_stop_notice_unpriced_names_fail_closed(capture):
+    ui.budget_stop_notice(budget_usd=2.00, spent_usd=0.0030, unpriced=True)
+    out = capture.export_text()
+    assert "warning" in out.lower()
+    # Conveys that a model could not be priced/measured against the budget.
+    assert "could not be measured" in out
+    # The budget ceiling is still named.
+    assert "$2.0000" in out
+    # The shown priced spend is named AND flagged as excluding the unaccountable calls.
+    assert "$0.0030" in out
+    assert "EXCLUDES" in out
+    # The fail-closed message takes precedence over the plain "budget reached" line.
+    assert "of $2.0000 budget" not in out
+
+
 # ---------------------------------------------------------------------------
 # professors_table
 # ---------------------------------------------------------------------------

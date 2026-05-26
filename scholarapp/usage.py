@@ -95,6 +95,18 @@ class UsageTracker:
     def total_cost_usd(self) -> float:
         return sum(r.cost_usd for r in self.records)
 
+    @property
+    def has_unpriced_calls(self) -> bool:
+        """True if any recorded call used a model absent from PRICING (is_priced False).
+
+        Such calls contribute 0.0 to `total_cost_usd` only because their rate is
+        unknown — NOT because they were free. A budget ceiling can't measure that
+        spend, so the CLI's boundary gate fails closed on it: any unpriced call
+        under an active budget is itself a stop condition, regardless of how small
+        the recognized spend is.
+        """
+        return any(not r.is_priced for r in self.records)
+
 
 # Contextvar lets async tasks inherit the parent's tracker without explicit threading.
 _current: contextvars.ContextVar[UsageTracker | None] = contextvars.ContextVar(
