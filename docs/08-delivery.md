@@ -116,33 +116,80 @@ Narrow scope = minimum blast radius if the token is compromised.
 
 ## MIME construction
 
-`_build_mime(draft, to_addr, from_addr)` produces an RFC 822 plain-text email
-and returns its base64url-encoded raw string (what Gmail's API takes).
+`_build_mime(draft, to_addr, from_addr, resume_bytes=None)` produces an RFC 822
+email and returns its base64url-encoded raw string (what Gmail's API takes).
 
 - **Headers:** `To`, `From`, `Subject`.
 - **Body:** `draft.body` as plain text. Line breaks preserved.
 - **Encoding:** UTF-8.
-- **Attachments:** not supported. (The drafting step doesn't produce any.)
+- **Attachments:** off by default. When `resume_bytes is None` (the default, and
+  the only behavior when the resume toggle is off) the message is plain text —
+  byte-identical to before. When `resume_bytes` is supplied the message becomes
+  multipart: the text body plus a single `application/pdf` attachment named
+  `resume.pdf`. See [Resume attachment](#resume-attachment-default-off).
 - **HTML:** not generated. Cold emails are more readable as plain text and
   more likely to land in the inbox than the promotions tab.
 
 The `Date` and `Message-ID` headers are added by Gmail server-side.
 
+## Resume attachment (default off)
+
+Outgoing emails can optionally carry the user's resume PDF as an attachment named
+`resume.pdf`. The bytes come from the run's snapshotted `Run.resume_path`, read
+**once per run** at the top of `send_approved` (not per draft).
+
+**Off by default, and command-driven** — there is no env var. Flip it with:
+
+```bash
+scholar attach-resume on    # attach resume.pdf to outgoing emails
+scholar attach-resume off   # plain text only (default)
+```
+
+The preference is persisted in `~/.scholarapp/config.toml` under
+`[send].attach_resume` and is **sticky across runs**. `load_settings` reads it
+back via stdlib `tomllib` into `Settings.send_attach_resume`; a missing or
+malformed config is treated as "not set" (→ off). The choice is intentionally
+*not* an env var so it survives `.env` churn and reads as a deliberate, persisted
+decision.
+
+- **Off:** emails are plain text, exactly as before.
+- **On:** the message is multipart (text body + the PDF).
+
+**Reads on the gated path only.** The attachment logic lives entirely inside the
+real-send branch — it does nothing unless `SEND_ENABLED=true`. The
+[`SEND_ENABLED` gate](#the-send_enabled-gate) is independent of this toggle and
+is unchanged.
+
+**A missing/unreadable resume never crashes the run.** When the toggle is on,
+the PDF is read once; if that read fails (e.g. the file moved), every draft in
+the batch is logged with a per-draft `SendLog` `outcome='error'` and the loop
+continues. No email goes out without the attachment it was supposed to carry, and
+one bad file doesn't take down the rest of the batch.
+
+> **Deliverability tradeoff — why this defaults off.** Plain-text cold emails
+> generally have *higher* deliverability than a multipart message with a PDF
+> attached, which is more likely to be flagged as spam. Attaching your resume can
+> help a warm recipient but hurts inbox placement at scale. Turn it on
+> consciously, ideally only for small, targeted batches.
+
 ## Send loop
 
 ```
+(if attach_resume on: read Run.resume_path once → resume_bytes, else None)
 For each approved draft:
     if report.sent >= remaining_budget: stop
     if professor row missing: log error, continue
-    build MIME → users.messages.send
+    if resume requested but unreadable: log error, continue
+    build MIME (+ resume_bytes) → users.messages.send
         success → Draft.status = sent, SendLog(sent, gmail_message_id)
         HttpError → SendLog(error), continue
         unexpected → SendLog(error: unexpected), continue
 ```
 
-**Per-draft errors do not stop the rest of the run.** One bad email address →
-that draft is logged with `outcome='error'`, the loop continues. The
-`DeliveryReport` carries the count + error messages.
+**Per-draft errors do not stop the rest of the run.** One bad email address — or
+one unreadable resume when the attachment toggle is on — is logged with
+`outcome='error'` and the loop continues. The `DeliveryReport` carries the count
++ error messages.
 
 ## Daily cap
 
