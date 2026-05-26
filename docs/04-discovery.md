@@ -46,9 +46,13 @@ class DiscoveryResult:
   [The `exclude_ids` contract](#the-exclude_ids-contract-how-passes-make-progress) and
   [Termination conditions](#termination-conditions) below.
 
-`user_interests` is accepted but not yet used — actual relevance ranking happens in
-Step 5 (matching). Today it's a forward-compatible knob for future "narrow the author
-pool by interest" logic.
+`user_interests` **is** used — for topic resolution. It flows through
+`find_professors` → `_resolve_topics` → both the OpenAlex `/topics` searches and the
+LLM topic pick (see [Interest-aware topic picking](#interest-aware-topic-picking)). What
+is **Not yet implemented** is using interests to *narrow the author pool* — once topics
+are picked, the `/authors` query is by topic + citation count only, and per-author
+relevance ranking against interests happens later in Step 5 (matching). So interests
+shape *which topics* we pull authors from, not *which authors* within those topics.
 
 `exclude_ids` is the keyword-only hook the CLI's count-guarantee top-up loop uses to
 ask for *new* candidates on repeat passes. It holds short-form OpenAlex author IDs
@@ -452,7 +456,9 @@ literal-sounding match — usually the broad clinical / cellular topic — and
 discovery returns the wrong *kind* of neuroscientist. Matching (Step 5) then
 correctly returns 0 picks for everyone, and the user pays for a useless run.
 
-Pass `user_interests=[]` (the default) to fall back to field-only picking.
+Pass `user_interests=[]` to fall back to field-only picking (`user_interests` is a
+required positional argument — there is no implicit default; `_resolve_topics` and
+`_llm_pick_topics` treat an empty list the same as "none provided").
 
 ## Over-fetch then filter
 

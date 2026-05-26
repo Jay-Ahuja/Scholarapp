@@ -136,7 +136,8 @@ The `Date` and `Message-ID` headers are added by Gmail server-side.
 
 Outgoing emails can optionally carry the user's resume PDF as an attachment named
 `resume.pdf`. The bytes come from the run's snapshotted `Run.resume_path`, read
-**once per run** at the top of `send_approved` (not per draft).
+**once per run** (not per draft) inside the real-send branch — after the
+`SEND_ENABLED` gate, just before the send loop.
 
 **Off by default, and command-driven** — there is no env var. Flip it with:
 

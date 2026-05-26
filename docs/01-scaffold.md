@@ -19,9 +19,9 @@ Scholarapp then:
 3. Matches a few of each professor's projects to the user's interests.
 4. Drafts a personalized email per professor using the template + matched material.
 5. Writes the drafts as editable markdown files for the user to review.
-6. (Eventually) sends approved drafts via the user's own Gmail account.
+6. Sends approved drafts via the user's own Gmail account.
 
-Step 6 is **disabled today** — the code path exists but is gated behind `SEND_ENABLED=false`. See [08-delivery.md](08-delivery.md) (added in Step 8) for the procedure to enable it.
+The Gmail send path (step 6) is **fully built but gated** behind `SEND_ENABLED=false`, so it never sends today. This is a gate, not a stub — the code is implemented; flipping the env var turns it on. See [08-delivery.md](08-delivery.md) for the procedure.
 
 ## The 7-module pipeline
 

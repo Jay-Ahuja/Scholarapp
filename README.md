@@ -40,6 +40,14 @@ scholar approve <run_id>      # sync your edits back to the DB and flip to appro
 scholar send <run_id>         # gated: prints "Sending disabled" until SEND_ENABLED=true
 ```
 
+Other commands:
+
+```bash
+scholar list                  # all runs, newest first
+scholar status <run_id>       # per-draft status table for a run
+scholar attach-resume on|off  # toggle attaching resume.pdf to outgoing emails (sticky; gated send path only)
+```
+
 Cheap-exploration shortcuts:
 
 ```bash
@@ -100,8 +108,11 @@ pytest tests/test_e2e.py
 pytest -m record tests/test_e2e_recording.py
 ```
 
-CI should run `pytest` (the default), which covers ~100 unit tests + the e2e
-test when its cassette exists.
+There is no automated test CI. The only GitHub Actions workflows are the Claude
+PR-assistant (`.github/workflows/claude.yml`) and the Claude code-review bot
+(`.github/workflows/claude-code-review.yml`); neither runs the suite. Run
+`pytest` locally before pushing — it covers the unit tests plus the e2e test
+when its cassette exists.
 
 ## Status
 

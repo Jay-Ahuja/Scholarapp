@@ -22,12 +22,12 @@ runs the above across all professors in parallel with a `Semaphore(10)`.
 ## Role in the pipeline
 
 ```
-Discovery (Step 4)      Matching (Step 5)            Drafting (Step 6, pending)
+Discovery (Step 4)      Matching (Step 5)            Drafting (Step 6)
 ─────────────────       ──────────────────           ───────────────────────────
 Professor              ┌─ one Claude call ─┐
   + 5 recent works ───►│ pick 2–3 picks    │───► MatchedProject ───► Email body
                        │ + why_relevant    │       (with title +     ("I noticed
-                       │ (Sonnet)          │        rationale)        your work
+                       │ (Haiku)           │        rationale)        your work
                        └───────────────────┘                          on X...")
 ```
 
