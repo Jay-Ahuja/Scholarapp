@@ -30,6 +30,15 @@ def _env_int(name: str, default: int) -> int:
     return int(raw)
 
 
+def _env_float(name: str, default: float | None) -> float | None:
+    # Mirrors _env_int but allows a None default so an unset var means "no value"
+    # (e.g. RUN_MAX_USD unset => no spend ceiling) rather than a magic sentinel.
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return float(raw)
+
+
 @dataclass(frozen=True)
 class Settings:
     """Immutable view of resolved env vars + derived paths.
@@ -57,6 +66,11 @@ class Settings:
     # Anthropic's SDK honors Retry-After headers; we just give it more chances
     # to ride out a long rate-limit window.
     anthropic_max_retries: int
+    # Optional per-run spend ceiling in USD. None => no ceiling (the default):
+    # estimation/cost work is purely informational and never blocks a run. The
+    # CLI decides what to do when an estimate exceeds this (confirm / abort);
+    # config only carries the value.
+    run_max_usd: float | None
 
     @property
     def db_path(self) -> Path:
@@ -131,4 +145,5 @@ def load_settings() -> Settings:
         data_dir=data_dir,
         anthropic_concurrency=_env_int("ANTHROPIC_CONCURRENCY", 3),
         anthropic_max_retries=_env_int("ANTHROPIC_MAX_RETRIES", 5),
+        run_max_usd=_env_float("RUN_MAX_USD", None),
     )

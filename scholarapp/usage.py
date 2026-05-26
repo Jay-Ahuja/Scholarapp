@@ -181,3 +181,149 @@ def summarize(tracker: UsageTracker) -> str:
     lines.append(total_line)
     lines.append(rule)
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Cost estimation
+#
+# Pure functions only — no DB, no Rich, no I/O. The CLI passes prior-run history
+# IN and persists estimates/results OUT; this module just does the arithmetic so
+# it stays trivially testable and reusable.
+# ---------------------------------------------------------------------------
+
+# The pipeline stages we estimate and report cost for, in display order. This is
+# the vocabulary shared with RunUsage.stage_costs and the CLI renderer.
+STAGES: tuple[str, ...] = ("discovery", "matching", "drafting")
+
+# CallRecord.label -> stage. Labels not present here (parse_resume / parse_prompt
+# — resume + prompt parsing) belong to NO stage and are intentionally excluded
+# from per-stage cost: they're one-off ingestion, not part of the per-professor
+# discovery/matching/drafting fan-out we estimate. Kept in sync with the
+# usage_tracker.record(...) call sites in scholarapp/modules/*.
+_LABEL_TO_STAGE: dict[str, str] = {
+    "pick_topics": "discovery",
+    "extract_email": "discovery",
+    "match_projects": "matching",
+    "draft_email": "drafting",
+}
+
+# Switch from the static guess to historical averaging once we have at least this
+# many real runs to average. One sample is too noisy (a single odd run skews the
+# mean); three gives a stable-enough baseline without waiting forever.
+_MIN_HISTORY_SAMPLES: int = 3
+
+# Static per-PROFESSOR cost assumptions (USD), used only when history is too thin.
+# Each value is a representative token mix priced via PRICING at module rates:
+#   discovery  ~ extract_email  (haiku): ~3000 in + 300 out
+#   matching   ~ match_projects (haiku): ~4000 in + 400 out
+#   drafting   ~ draft_email   (sonnet): ~3000 in + 600 out
+# These are deliberately round order-of-magnitude figures, not precise billing;
+# the historical basis supersedes them as soon as enough real runs exist.
+_STATIC_PER_PROF_USD: dict[str, float] = {
+    "discovery": 0.0045,
+    "matching": 0.0060,
+    "drafting": 0.0180,
+}
+
+# Static fixed (per-RUN, count-independent) cost. `pick_topics` runs once per run
+# regardless of professor count, so it can't scale with `count`; we attribute it
+# to discovery as a flat add-on (haiku: ~2000 in + 200 out ~= $0.003).
+_STATIC_FIXED_USD: dict[str, float] = {
+    "discovery": 0.0030,
+}
+
+
+@dataclass(frozen=True)
+class StageEstimate:
+    stage: str  # one of STAGES
+    cost_usd: float
+
+
+@dataclass(frozen=True)
+class CostEstimate:
+    count: int
+    total_usd: float  # invariant: == sum(s.cost_usd for s in stages)
+    stages: list[StageEstimate]  # one entry per STAGES key, in STAGES order
+    basis: str  # "historical" or "static"
+    sample_size: int  # historical runs averaged; 0 when "static"
+
+
+@dataclass(frozen=True)
+class RunCostSample:
+    count: int
+    stage_costs: dict[str, float]  # keyed by STAGES
+
+
+def stage_costs_from_tracker(tracker: UsageTracker) -> dict[str, float]:
+    """Aggregate the current run's CallRecords into per-STAGE USD totals.
+
+    Returns a dict with EVERY STAGES key present (0.0 when no call hit that
+    stage), so downstream persistence/averaging never has to guard for missing
+    keys. Records whose label maps to no stage (ingestion parsing) are ignored.
+    """
+    totals: dict[str, float] = {stage: 0.0 for stage in STAGES}
+    for r in tracker.records:
+        stage = _LABEL_TO_STAGE.get(r.label)
+        if stage is None:
+            continue  # ingestion / unmapped label: not a per-stage pipeline cost
+        totals[stage] += r.cost_usd
+    return totals
+
+
+def _static_estimate(count: int) -> CostEstimate:
+    """Order-of-magnitude estimate from PRICING-derived token assumptions.
+
+    Per-professor cost scales with `count`; the fixed per-run component does not.
+    Used when we have too little history to average. `count` is clamped at 0 so a
+    negative/zero count yields just the fixed component (no negative costs).
+    """
+    n = max(count, 0)
+    stages: list[StageEstimate] = []
+    for stage in STAGES:
+        cost = _STATIC_PER_PROF_USD.get(stage, 0.0) * n + _STATIC_FIXED_USD.get(stage, 0.0)
+        stages.append(StageEstimate(stage=stage, cost_usd=cost))
+    total = sum(s.cost_usd for s in stages)
+    return CostEstimate(
+        count=count,
+        total_usd=total,
+        stages=stages,
+        basis="static",
+        sample_size=0,
+    )
+
+
+def estimate_run_cost(count: int, history: list[RunCostSample] | None = None) -> CostEstimate:
+    """Estimate the USD cost of a run of `count` professors.
+
+    Historical basis: when we have >= _MIN_HISTORY_SAMPLES prior runs, compute a
+    per-professor, per-stage AVERAGE rate (total stage cost / total professors
+    across samples) and scale it by `count`. This normalizes for the fact that
+    past runs had different sizes. Falls back to the static PRICING-derived guess
+    when history is missing, empty, or too short.
+
+    Never raises on empty/short history. Samples with count <= 0 are skipped for
+    the rate calculation (they carry no per-professor signal and would divide by
+    zero); if that leaves nothing usable, we fall back to static.
+    """
+    usable = [s for s in (history or []) if s.count > 0]
+    if len(usable) < _MIN_HISTORY_SAMPLES:
+        return _static_estimate(count)
+
+    # Average per-professor rate per stage = summed stage cost / summed professors.
+    # Pooling totals (rather than averaging each run's own per-prof rate) weights
+    # larger runs more, which better reflects steady-state cost.
+    total_profs = sum(s.count for s in usable)
+    n = max(count, 0)
+    stages: list[StageEstimate] = []
+    for stage in STAGES:
+        stage_total = sum(s.stage_costs.get(stage, 0.0) for s in usable)
+        per_prof = stage_total / total_profs
+        stages.append(StageEstimate(stage=stage, cost_usd=per_prof * n))
+    total = sum(s.cost_usd for s in stages)
+    return CostEstimate(
+        count=count,
+        total_usd=total,
+        stages=stages,
+        basis="historical",
+        sample_size=len(usable),
+    )
