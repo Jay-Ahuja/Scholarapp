@@ -95,8 +95,13 @@ class Settings:
 def _read_attach_resume(config_path: Path) -> bool:
     """Read [send].attach_resume from config.toml via stdlib tomllib.
 
-    Missing file OR missing key/table => False. Never crashes on an absent or
-    malformed config.toml — a bad file is treated as "preference not set".
+    Enables attachments ONLY when the stored value is a genuine boolean True.
+    ANY non-boolean value (e.g. the string "false" OR "true", a number), a
+    missing key/table, a missing file, or a malformed config => False. We do
+    NOT coerce string values like "true"/"yes"/"1" — non-bool means off,
+    unconditionally. This guards against a hand-edited or tool-written
+    config.toml storing `attach_resume = "false"` (a STRING), which `bool(...)`
+    would read as truthy. Never crashes on an absent or malformed config.toml.
     """
     if not config_path.exists():
         return False
@@ -108,7 +113,9 @@ def _read_attach_resume(config_path: Path) -> bool:
     send_table = data.get("send")
     if not isinstance(send_table, dict):
         return False
-    return bool(send_table.get("attach_resume", False))
+    # Strict: only a real bool True counts. `is True` rejects truthy strings,
+    # numbers, etc. (note `1 == True` so an equality check would be wrong here).
+    return send_table.get("attach_resume") is True
 
 
 def load_settings() -> Settings:

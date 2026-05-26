@@ -63,6 +63,53 @@ def test_reads_false(tmp_path, monkeypatch):
     assert settings.send_attach_resume is False
 
 
+# ---------------------------------------------------------------------------
+# Strict-boolean interpretation: ONLY a genuine boolean True enables attachments.
+# Any non-bool value (string, number) — even a truthy one — resolves to off.
+# Guards a hand-edited / tool-written config where attach_resume is a STRING.
+# ---------------------------------------------------------------------------
+
+
+def test_string_false_is_off(tmp_path, monkeypatch):
+    """`attach_resume = "false"` (a STRING) must be off, not truthy-on."""
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    _write_config(tmp_path, '[send]\nattach_resume = "false"\n')
+    settings = load_settings()
+    assert settings.send_attach_resume is False
+
+
+def test_string_true_is_off(tmp_path, monkeypatch):
+    """`attach_resume = "true"` (a STRING) must be off — we do not coerce strings."""
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    _write_config(tmp_path, '[send]\nattach_resume = "true"\n')
+    settings = load_settings()
+    assert settings.send_attach_resume is False
+
+
+def test_string_truthy_values_are_off(tmp_path, monkeypatch):
+    """Common truthy strings ("yes"/"1"/"on") must NOT coerce to on."""
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    for value in ("yes", "1", "on"):
+        _write_config(tmp_path, f'[send]\nattach_resume = "{value}"\n')
+        assert load_settings().send_attach_resume is False, value
+
+
+def test_number_one_is_off(tmp_path, monkeypatch):
+    """A numeric 1 must be off — `1 == True` but `1 is not True`."""
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    _write_config(tmp_path, "[send]\nattach_resume = 1\n")
+    settings = load_settings()
+    assert settings.send_attach_resume is False
+
+
+def test_genuine_bool_true_is_on(tmp_path, monkeypatch):
+    """Only a real TOML boolean true flips the toggle on."""
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    _write_config(tmp_path, "[send]\nattach_resume = true\n")
+    settings = load_settings()
+    assert settings.send_attach_resume is True
+
+
 def test_malformed_config_does_not_crash(tmp_path, monkeypatch):
     """A malformed config.toml is treated as 'preference not set', not a crash."""
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
