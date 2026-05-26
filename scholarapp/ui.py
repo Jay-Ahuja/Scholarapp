@@ -27,6 +27,8 @@ from rich.panel import Panel
 from rich.rule import Rule
 from rich.table import Table
 
+from scholarapp.usage import UNPRICED_MARKER
+
 # Production singletons. Tests replace these via monkeypatch.
 console: Console = Console()
 error_console: Console = Console(stderr=True)
@@ -237,6 +239,7 @@ def render_usage_table(tracker: Any) -> None:
 
     total_cost = 0.0
     by_model_cost: dict[str, float] = {}
+    any_unpriced = False
 
     for label, records in grouped.items():
         n = len(records)
@@ -247,11 +250,19 @@ def render_usage_table(tracker: Any) -> None:
         )
         out_tot = sum(r.output_tokens for r in records)
         cost = sum(r.cost_usd for r in records)
+        # A group is unpriced when any call used a model id not in PRICING. Its
+        # $0.00 cost is "unknown rate," not "free," so flag it rather than show $0.
+        group_unpriced = any(not r.is_priced for r in records)
 
         model_id = records[0].model
         model_short = model_id.split("-")[1] if "-" in model_id else model_id
         mc = _model_color(model_short)
 
+        cost_cell = (
+            f"[yellow]{UNPRICED_MARKER}[/yellow]"
+            if group_unpriced
+            else f"${cost:.4f}"
+        )
         label_with_count = f"{label} × {n}" if n > 1 else label
         table.add_row(
             label_with_count,
@@ -259,20 +270,26 @@ def render_usage_table(tracker: Any) -> None:
             f"{in_tot:,}",
             f"{cache_tot:,}",
             f"{out_tot:,}",
-            f"${cost:.4f}",
+            cost_cell,
         )
 
         total_cost += cost
-        by_model_cost[model_short] = by_model_cost.get(model_short, 0.0) + cost
+        if group_unpriced:
+            any_unpriced = True
+        else:
+            by_model_cost[model_short] = by_model_cost.get(model_short, 0.0) + cost
 
     table.add_section()
+    total_cell = f"[bold]${total_cost:.4f}[/bold]"
+    if any_unpriced:
+        total_cell += f" [yellow](+ {UNPRICED_MARKER})[/yellow]"
     table.add_row(
         "[bold]Total[/bold]",
         "",
         "",
         "",
         "",
-        f"[bold]${total_cost:.4f}[/bold]",
+        total_cell,
     )
 
     console.print(table)

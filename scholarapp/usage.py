@@ -47,6 +47,16 @@ class CallRecord:
     output_tokens: int
 
     @property
+    def is_priced(self) -> bool:
+        """True if this record's model has a known entry in PRICING.
+
+        When False, `cost_usd` is 0.0 only because the model is unrecognized — not
+        because the call was free. Callers rendering a summary should flag such
+        spend as unpriced/unknown rather than display it as $0.00.
+        """
+        return self.model in PRICING
+
+    @property
     def cost_usd(self) -> float:
         p = PRICING.get(self.model)
         if p is None:
@@ -112,6 +122,11 @@ def record(label: str, model: str, usage: Any) -> None:
 # Formatting
 # ---------------------------------------------------------------------------
 
+# Shown in place of a dollar figure when a call's model id isn't in PRICING. An
+# unrecognized model has no rate, so its true cost is unknown — surfacing "$0.00"
+# would silently hide real spend. We flag it instead.
+UNPRICED_MARKER = "unpriced"
+
 
 def summarize(tracker: UsageTracker) -> str:
     """Pretty multi-line summary grouped by call label."""
@@ -128,6 +143,7 @@ def summarize(tracker: UsageTracker) -> str:
 
     total_cost = 0.0
     by_model_cost: dict[str, float] = {}
+    any_unpriced = False
 
     for label, records in grouped.items():
         n = len(records)
@@ -135,21 +151,33 @@ def summarize(tracker: UsageTracker) -> str:
         cache_read = sum(r.cache_read_input_tokens for r in records)
         out_tot = sum(r.output_tokens for r in records)
         cost = sum(r.cost_usd for r in records)
+        # A group is unpriced if any of its calls used a model not in PRICING.
+        # Such calls contribute 0.0 to `cost` only because their rate is unknown,
+        # so we flag the group rather than print a misleading "$0.0000".
+        group_unpriced = any(not r.is_priced for r in records)
+        cost_text = UNPRICED_MARKER if group_unpriced else f"${cost:.4f}"
         # Short model tag ("sonnet" / "haiku") parsed from the model id.
         model_id = records[0].model
         model_short = model_id.split("-")[1] if "-" in model_id else model_id
         label_with_count = f"{label} × {n}" if n > 1 else label
         lines.append(
             f"  {label_with_count:<22} {model_short:<7} "
-            f"in={in_tot:>6}  cache={cache_read:>5}  out={out_tot:>5}  ${cost:.4f}"
+            f"in={in_tot:>6}  cache={cache_read:>5}  out={out_tot:>5}  {cost_text}"
         )
         total_cost += cost
-        by_model_cost[model_short] = by_model_cost.get(model_short, 0.0) + cost
+        if group_unpriced:
+            any_unpriced = True
+        else:
+            by_model_cost[model_short] = by_model_cost.get(model_short, 0.0) + cost
 
     lines.append(rule)
     breakdown = ", ".join(
         f"{m.capitalize()} ${c:.4f}" for m, c in by_model_cost.items()
     )
-    lines.append(f"  Total: ${total_cost:.4f}   ({breakdown})")
+    total_line = f"  Total: ${total_cost:.4f}   ({breakdown})"
+    if any_unpriced:
+        # The total covers only priced calls; some spend can't be costed.
+        total_line += f"  [+ {UNPRICED_MARKER} call(s)]"
+    lines.append(total_line)
     lines.append(rule)
     return "\n".join(lines)

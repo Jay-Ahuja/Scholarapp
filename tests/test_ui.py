@@ -151,6 +151,42 @@ def test_usage_table_renders_grouped_records(capture):
     assert "4,000" in out
 
 
+def test_usage_table_flags_unpriced_model(capture):
+    from scholarapp.usage import UNPRICED_MARKER
+
+    tracker = usage_tracker.UsageTracker()
+    # One known model + one unrecognized model id.
+    tracker.record(
+        "parse_resume", "claude-sonnet-4-6",
+        _u(input_tokens=1000, output_tokens=500),
+    )
+    tracker.record(
+        "mystery_call", "claude-bogus-9-9",
+        _u(input_tokens=10000, output_tokens=1000),
+    )
+    ui.render_usage_table(tracker)
+    out = capture.export_text()
+    # Unknown model row is flagged unpriced rather than rendered as $0.00.
+    assert UNPRICED_MARKER in out
+    assert "mystery_call" in out
+    assert "$0.0000" not in out
+    # The recognized model's cost is unchanged: 1000*$3/M + 500*$15/M = $0.0105.
+    assert "$0.0105" in out
+
+
+def test_usage_table_no_unpriced_marker_for_known_models(capture):
+    from scholarapp.usage import UNPRICED_MARKER
+
+    tracker = usage_tracker.UsageTracker()
+    tracker.record(
+        "extract_email", "claude-haiku-4-5",
+        _u(input_tokens=2000, output_tokens=200),
+    )
+    ui.render_usage_table(tracker)
+    out = capture.export_text()
+    assert UNPRICED_MARKER not in out
+
+
 # ---------------------------------------------------------------------------
 # professors_table
 # ---------------------------------------------------------------------------
