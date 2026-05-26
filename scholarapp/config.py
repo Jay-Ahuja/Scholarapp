@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import os
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -40,6 +41,11 @@ class Settings:
     tavily_api_key: str | None
     send_enabled: bool
     send_daily_cap: int
+    # Persistent, default-off preference: when True the real-send branch attaches
+    # the run's resume PDF (as resume.pdf) to each outgoing email. Lives in
+    # config.toml ([send].attach_resume), NOT an env var — it's command-driven via
+    # `scholar attach-resume on|off`. The SEND_ENABLED gate is independent of this.
+    send_attach_resume: bool
     data_dir: Path
     # Concurrency cap for parallel Anthropic calls in each pipeline stage
     # (discovery enrichment / matching / drafting). Tier 1 Anthropic accounts
@@ -86,14 +92,35 @@ class Settings:
         return (Path.cwd() / "drafts").resolve()
 
 
+def _read_attach_resume(config_path: Path) -> bool:
+    """Read [send].attach_resume from config.toml via stdlib tomllib.
+
+    Missing file OR missing key/table => False. Never crashes on an absent or
+    malformed config.toml — a bad file is treated as "preference not set".
+    """
+    if not config_path.exists():
+        return False
+    try:
+        with config_path.open("rb") as fh:
+            data = tomllib.load(fh)
+    except (OSError, tomllib.TOMLDecodeError):
+        return False
+    send_table = data.get("send")
+    if not isinstance(send_table, dict):
+        return False
+    return bool(send_table.get("attach_resume", False))
+
+
 def load_settings() -> Settings:
-    """Read env vars and return a fresh Settings."""
+    """Read env vars + config.toml and return a fresh Settings."""
     data_dir = Path(os.environ.get("DATA_DIR", "~/.scholarapp")).expanduser().resolve()
+    config_path = data_dir / "config.toml"
     return Settings(
         anthropic_api_key=os.environ.get("ANTHROPIC_API_KEY") or None,
         tavily_api_key=os.environ.get("TAVILY_API_KEY") or None,
         send_enabled=_env_bool("SEND_ENABLED", False),
         send_daily_cap=_env_int("SEND_DAILY_CAP", 20),
+        send_attach_resume=_read_attach_resume(config_path),
         data_dir=data_dir,
         anthropic_concurrency=_env_int("ANTHROPIC_CONCURRENCY", 3),
         anthropic_max_retries=_env_int("ANTHROPIC_MAX_RETRIES", 5),

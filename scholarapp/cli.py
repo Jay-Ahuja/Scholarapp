@@ -91,6 +91,21 @@ version = "0.1.0"
 """
 
 
+def _render_config_toml(*, attach_resume: bool) -> str:
+    """Render the app-owned config.toml from its known keys.
+
+    tomllib is read-only and we don't pull in a TOML writer dependency, so this
+    is a small templated string built from the keys the app owns. The [app]
+    block is preserved verbatim from DEFAULT_CONFIG_TOML; the [send] block holds
+    the sticky attach_resume preference read back by config.load_settings.
+    """
+    return (
+        DEFAULT_CONFIG_TOML
+        + "\n[send]\n"
+        + f"attach_resume = {'true' if attach_resume else 'false'}\n"
+    )
+
+
 def _not_implemented(command: str) -> None:
     ui.info(f"[dim]Not yet implemented:[/dim] {command}")
     raise typer.Exit(code=0)
@@ -834,6 +849,42 @@ def status(run_id: str = typer.Argument(..., help="Run ID to inspect.")) -> None
         ui.run_header(run)
         ui.info("")
         ui.drafts_table(drafts, professors)
+
+    _run_safely(_impl)
+
+
+class AttachResumeState(str, enum.Enum):
+    """Argument for `scholar attach-resume`."""
+
+    on = "on"
+    off = "off"
+
+
+@app.command("attach-resume")
+def attach_resume_cmd(
+    state: AttachResumeState = typer.Argument(
+        ..., help="Turn resume PDF attachment on or off for outgoing emails."
+    ),
+) -> None:
+    """Persist whether to attach the run's resume.pdf to outgoing emails.
+
+    The preference is written to config.toml under [send].attach_resume and is
+    sticky across runs. It only takes effect on the real-send path (gated behind
+    SEND_ENABLED).
+    """
+
+    def _impl() -> None:
+        settings = load_settings()
+        settings.data_dir.mkdir(parents=True, exist_ok=True)
+        attach = state is AttachResumeState.on
+        settings.config_path.write_text(
+            _render_config_toml(attach_resume=attach), encoding="utf-8"
+        )
+        word = "on" if attach else "off"
+        ui.info(
+            f"[green]Resume attachment {word}.[/green] "
+            f"Saved to [bold]{settings.config_path}[/bold]."
+        )
 
     _run_safely(_impl)
 
