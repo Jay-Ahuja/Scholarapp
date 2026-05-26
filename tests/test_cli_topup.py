@@ -1248,6 +1248,48 @@ def test_budget_crossed_during_topup_partial_delivery(e2e_setup, monkeypatch):
         assert len(repo.list_drafts_for_run(session, run.id)) == 1
 
 
+def test_partial_run_records_realized_not_requested_counts(e2e_setup, monkeypatch):
+    """A budget-stopped run records the REALIZED per-stage size, not `count`=3.
+
+    Drafting realized count must be the number actually drafted (1), so future
+    estimates divide drafting spend by 1 — not by the requested 3 — and don't
+    understate the drafting rate.
+    """
+    from scholarapp import usage
+
+    inputs = e2e_setup["inputs"]
+    _mock_ingestion(monkeypatch, count=3)
+
+    fake_disc = _CostingDiscovery(pool=["a", "b", "c", "d", "e"], dollars_per_call=1.0)
+    fake_match = _CostingMatching(qualifying={"a", "d", "e"}, dollars_per_call=0.5)
+    fake_draft = _CostingDrafting(dollars_per_call=0.1)
+    monkeypatch.setattr(discovery, "find_professors", fake_disc)
+    monkeypatch.setattr(matching, "match_projects_for_run", fake_match)
+    monkeypatch.setattr(drafting, "draft_emails_for_run", fake_draft)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["run", "--inputs", str(inputs), "--budget", "1.50", "--yes"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert fake_draft.request_counts == [1]  # only 1 professor was drafted
+
+    with get_session() as session:
+        run = _the_run(session)
+        rows = repo.list_recent_run_usage(session)
+        assert len(rows) == 1
+        # The requested count is preserved as-is...
+        assert rows[0].count == 3
+        _, counts = usage.unpack_stage_usage(rows[0].stage_costs)
+        # ...but the realized drafting count is what was actually drafted (1),
+        # NOT the requested 3. Discovery persisted only the initial pass's profs.
+        n_profs = len(repo.list_professors_for_run(session, run.id))
+        assert counts["discovery"] == n_profs
+        assert counts["matching"] == 1  # only `a` matched before the budget broke
+        assert counts["drafting"] == 1
+
+
 # ---------------------------------------------------------------------------
 # Exactly one RunUsage row per completed run
 # ---------------------------------------------------------------------------
@@ -1279,13 +1321,17 @@ def test_completed_run_writes_exactly_one_run_usage_row(e2e_setup, monkeypatch):
         row = rows[0]
         assert row.run_id == run.id
         assert row.count == 2
-        # stage_costs is keyed by usage.STAGES and totals match the recorded spend:
+        # The JSON value carries the tagged costs + realized counts; unpack to read.
+        costs, counts = usage.unpack_stage_usage(row.stage_costs)
+        # Costs are keyed by usage.STAGES and total the recorded spend:
         # discovery $0.20, matching $0.30, drafting $0.40.
-        assert set(row.stage_costs) == set(usage.STAGES)
-        assert row.stage_costs["discovery"] == pytest.approx(0.2)
-        assert row.stage_costs["matching"] == pytest.approx(0.3)
-        assert row.stage_costs["drafting"] == pytest.approx(0.4)
+        assert set(costs) == set(usage.STAGES)
+        assert costs["discovery"] == pytest.approx(0.2)
+        assert costs["matching"] == pytest.approx(0.3)
+        assert costs["drafting"] == pytest.approx(0.4)
         assert row.total_usd == pytest.approx(0.9)
+        # A full run drafted all 2 professors -> realized per-stage counts all 2.
+        assert counts == {"discovery": 2, "matching": 2, "drafting": 2}
 
 
 def test_refused_run_writes_no_run_usage_row(e2e_setup, monkeypatch):

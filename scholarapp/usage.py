@@ -250,8 +250,48 @@ class CostEstimate:
 
 @dataclass(frozen=True)
 class RunCostSample:
-    count: int
+    count: int  # requested count; informational only — NOT used for rate math
     stage_costs: dict[str, float]  # keyed by STAGES
+    # Realized professors that actually passed through each stage, keyed by STAGES.
+    # This is what the rate math divides by now (a budget-stopped run drafts fewer
+    # than `count`, so dividing spend by the requested count would understate the
+    # per-prof rate). EMPTY for legacy rows persisted before this field existed —
+    # such samples are excluded from a stage's pool rather than skewing it.
+    stage_counts: dict[str, int] = field(default_factory=dict)
+
+
+# --- Persisted-shape helpers ------------------------------------------------
+#
+# The run_usage.stage_costs JSON column carries BOTH the per-stage costs and the
+# per-stage realized counts. We cannot add a column (create_all can't ALTER an
+# existing table — see RunUsage docstring / ADR 0001), so the richer value rides
+# inside the existing JSON column. New rows use the tagged {"costs", "counts"}
+# shape; legacy rows are the bare {stage: float} cost map and unpack with empty
+# counts so old history still feeds the estimator (just excluded per-stage).
+
+
+def pack_stage_usage(
+    stage_costs: dict[str, float], stage_counts: dict[str, int]
+) -> dict:
+    """Build the tagged JSON value stored in run_usage.stage_costs.
+
+    Shape: {"costs": {stage: float}, "counts": {stage: int}}. The two tag keys
+    distinguish a new row from a legacy bare-costs map on read.
+    """
+    return {"costs": dict(stage_costs), "counts": dict(stage_counts)}
+
+
+def unpack_stage_usage(stored: dict) -> tuple[dict[str, float], dict[str, int]]:
+    """Split a stored run_usage.stage_costs value into (stage_costs, stage_counts).
+
+    Tolerates the legacy bare-costs shape ({stage: float}, no "costs"/"counts"
+    keys) by returning the dict as the costs and an EMPTY counts dict — legacy
+    rows carry no realized-count signal, so the estimator excludes them per stage.
+    """
+    if "costs" in stored or "counts" in stored:
+        return dict(stored.get("costs", {})), dict(stored.get("counts", {}))
+    # Legacy bare-costs map: the whole dict IS the per-stage cost; no counts.
+    return dict(stored), {}
 
 
 def stage_costs_from_tracker(tracker: UsageTracker) -> dict[str, float]:
@@ -295,35 +335,60 @@ def _static_estimate(count: int) -> CostEstimate:
 def estimate_run_cost(count: int, history: list[RunCostSample] | None = None) -> CostEstimate:
     """Estimate the USD cost of a run of `count` professors.
 
-    Historical basis: when we have >= _MIN_HISTORY_SAMPLES prior runs, compute a
-    per-professor, per-stage AVERAGE rate (total stage cost / total professors
-    across samples) and scale it by `count`. This normalizes for the fact that
-    past runs had different sizes. Falls back to the static PRICING-derived guess
-    when history is missing, empty, or too short.
+    Historical basis, computed INDEPENDENTLY per stage: a stage's per-professor
+    rate is pooled over only the samples that recorded a realized count for THAT
+    stage —
 
-    Never raises on empty/short history. Samples with count <= 0 are skipped for
-    the rate calculation (they carry no per-professor signal and would divide by
-    zero); if that leaves nothing usable, we fall back to static.
+        rate[stage] = sum(sample.stage_costs[stage]) / sum(sample.stage_counts[stage])
+
+    over samples where stage_counts[stage] > 0; the stage's estimate is
+    rate[stage] * count. Dividing by the realized per-stage count (not the
+    requested `count`) is the fix: a budget-stopped run drafts fewer professors
+    than requested, so its drafting spend reflects the smaller realized size —
+    dividing that spend by the requested count would understate the rate and drag
+    future estimates below equivalent full runs.
+
+    Per-stage fallback: a stage with fewer than _MIN_HISTORY_SAMPLES count-bearing
+    samples (or zero pooled count) uses the static per-stage estimate instead of a
+    noisy/undefined rate. `basis` is "historical" only when at least one stage's
+    realized rate drove its estimate; `sample_size` is the number of count-bearing
+    samples pooled (max across stages — the depth of usable realized history).
+
+    Legacy samples carry empty stage_counts and are simply absent from every
+    stage's pool, so a history mixing new + legacy rows estimates without error.
+    Never raises on empty/short/legacy history — it falls back to static.
     """
-    usable = [s for s in (history or []) if s.count > 0]
-    if len(usable) < _MIN_HISTORY_SAMPLES:
-        return _static_estimate(count)
-
-    # Average per-professor rate per stage = summed stage cost / summed professors.
-    # Pooling totals (rather than averaging each run's own per-prof rate) weights
-    # larger runs more, which better reflects steady-state cost.
-    total_profs = sum(s.count for s in usable)
+    samples = list(history or [])
+    static = _static_estimate(count)
     n = max(count, 0)
+
     stages: list[StageEstimate] = []
+    any_historical = False
+    # Depth of the realized history actually used: the largest per-stage pool of
+    # count-bearing samples. 0 when no stage had enough realized counts.
+    max_pool_samples = 0
     for stage in STAGES:
-        stage_total = sum(s.stage_costs.get(stage, 0.0) for s in usable)
-        per_prof = stage_total / total_profs
-        stages.append(StageEstimate(stage=stage, cost_usd=per_prof * n))
+        # Pool only samples that realized a positive count for THIS stage. A
+        # missing/zero count (legacy or a stage a run never reached) contributes
+        # neither cost nor count, so it can't skew the rate or divide by zero.
+        pooled = [s for s in samples if s.stage_counts.get(stage, 0) > 0]
+        pooled_count = sum(s.stage_counts[stage] for s in pooled)
+        if len(pooled) >= _MIN_HISTORY_SAMPLES and pooled_count > 0:
+            pooled_cost = sum(s.stage_costs.get(stage, 0.0) for s in pooled)
+            per_prof = pooled_cost / pooled_count
+            stages.append(StageEstimate(stage=stage, cost_usd=per_prof * n))
+            any_historical = True
+            max_pool_samples = max(max_pool_samples, len(pooled))
+        else:
+            # Too little realized history for this stage: keep the static guess.
+            static_stage = next(s for s in static.stages if s.stage == stage)
+            stages.append(static_stage)
+
     total = sum(s.cost_usd for s in stages)
     return CostEstimate(
         count=count,
         total_usd=total,
         stages=stages,
-        basis="historical",
-        sample_size=len(usable),
+        basis="historical" if any_historical else "static",
+        sample_size=max_pool_samples if any_historical else 0,
     )

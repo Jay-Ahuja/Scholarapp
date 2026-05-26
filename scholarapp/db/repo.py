@@ -28,6 +28,7 @@ from scholarapp.db.models import (
     SendLog,
     SendOutcome,
 )
+from scholarapp.usage import pack_stage_usage
 
 # ---------------------------------------------------------------------------
 # Run
@@ -284,12 +285,21 @@ def add_run_usage(
     count: int,
     total_usd: float,
     stage_costs: dict[str, float],
+    stage_counts: dict[str, int],
 ) -> RunUsage:
+    """Persist one run's realized cost history.
+
+    The per-stage costs AND the per-stage realized professor counts are packed
+    into the single `stage_costs` JSON column via usage.pack_stage_usage (the
+    project has no migrations, so we can't add a column for the counts). The
+    estimator divides each stage's pooled spend by its pooled realized count, so
+    a budget-stopped run's smaller drafting size is recorded honestly here.
+    """
     usage = RunUsage(
         run_id=run_id,
         count=count,
         total_usd=total_usd,
-        stage_costs=stage_costs,
+        stage_costs=pack_stage_usage(stage_costs, stage_counts),
     )
     session.add(usage)
     session.flush()

@@ -14,11 +14,25 @@ from scholarapp.usage import (
     StageEstimate,
     UsageTracker,
     estimate_run_cost,
+    pack_stage_usage,
     record,
     set_tracker,
     stage_costs_from_tracker,
     summarize,
+    unpack_stage_usage,
 )
+
+
+def _sample(count, *, stage_costs, stage_counts=None):
+    """Build a RunCostSample.
+
+    `stage_counts` defaults to the realized==requested full-run case: every stage
+    processed `count` professors. Tests that need a budget-stopped/partial run pass
+    explicit per-stage counts; tests that need a legacy (counts-less) row pass {}.
+    """
+    if stage_counts is None:
+        stage_counts = {s: count for s in STAGES}
+    return RunCostSample(count=count, stage_costs=stage_costs, stage_counts=stage_counts)
 
 
 def _u(*, input_tokens=0, output_tokens=0, cache_creation=0, cache_read=0) -> SimpleNamespace:
@@ -278,10 +292,8 @@ def test_estimate_static_scales_with_count():
 
 
 def test_estimate_static_below_min_samples_stays_static():
-    # Two samples is below the threshold -> still static.
-    history = [
-        RunCostSample(count=10, stage_costs={s: 1.0 for s in STAGES}) for _ in range(2)
-    ]
+    # Two count-bearing samples is below the threshold -> still static.
+    history = [_sample(10, stage_costs={s: 1.0 for s in STAGES}) for _ in range(2)]
     est = estimate_run_cost(10, history)
     assert est.basis == "static"
     assert est.sample_size == 0
@@ -300,10 +312,8 @@ def test_estimate_zero_count_is_nonnegative_static():
 
 
 def test_estimate_historical_when_enough_samples():
-    # Three runs of 10 profs each, $1 total per stage -> $0.10/prof/stage.
-    history = [
-        RunCostSample(count=10, stage_costs={s: 1.0 for s in STAGES}) for _ in range(3)
-    ]
+    # Three runs of 10 realized profs each, $1 total per stage -> $0.10/prof/stage.
+    history = [_sample(10, stage_costs={s: 1.0 for s in STAGES}) for _ in range(3)]
     est = estimate_run_cost(10, history)
     assert est.basis == "historical"
     assert est.sample_size == 3
@@ -314,12 +324,12 @@ def test_estimate_historical_when_enough_samples():
 
 
 def test_estimate_historical_pools_totals_weighting_larger_runs():
-    # Pooled rate = total cost / total profs, NOT mean of per-run rates.
-    # Run A: 1 prof, $1 drafting -> 1.0/prof. Run B+C: 9 profs, $9 -> 1.0/prof.
+    # Pooled rate = total cost / total REALIZED profs, NOT mean of per-run rates.
+    # Run A: 1 prof, $1 drafting -> 1.0/prof. Run B+C: 9/5 profs, $9/$5 -> 1.0/prof.
     history = [
-        RunCostSample(count=1, stage_costs={"discovery": 0.0, "matching": 0.0, "drafting": 1.0}),
-        RunCostSample(count=9, stage_costs={"discovery": 0.0, "matching": 0.0, "drafting": 9.0}),
-        RunCostSample(count=5, stage_costs={"discovery": 0.0, "matching": 0.0, "drafting": 5.0}),
+        _sample(1, stage_costs={"discovery": 0.0, "matching": 0.0, "drafting": 1.0}),
+        _sample(9, stage_costs={"discovery": 0.0, "matching": 0.0, "drafting": 9.0}),
+        _sample(5, stage_costs={"discovery": 0.0, "matching": 0.0, "drafting": 5.0}),
     ]
     est = estimate_run_cost(3, history)
     assert est.basis == "historical"
@@ -328,25 +338,177 @@ def test_estimate_historical_pools_totals_weighting_larger_runs():
     assert abs(drafting.cost_usd - 3.0) < 1e-12
 
 
-def test_estimate_skips_zero_count_samples():
-    # Two real samples + one zero-count sample = only 2 usable -> below threshold.
+def test_estimate_skips_zero_count_stage_samples():
+    # Two real samples + one whose per-stage counts are 0 = only 2 count-bearing
+    # per stage -> below threshold, static fallback, no div-by-zero.
     history = [
-        RunCostSample(count=10, stage_costs={s: 1.0 for s in STAGES}),
-        RunCostSample(count=10, stage_costs={s: 1.0 for s in STAGES}),
-        RunCostSample(count=0, stage_costs={s: 999.0 for s in STAGES}),
+        _sample(10, stage_costs={s: 1.0 for s in STAGES}),
+        _sample(10, stage_costs={s: 1.0 for s in STAGES}),
+        _sample(
+            0,
+            stage_costs={s: 999.0 for s in STAGES},
+            stage_counts={s: 0 for s in STAGES},
+        ),
     ]
     est = estimate_run_cost(10, history)
-    # The zero-count sample is dropped, leaving 2 usable -> static fallback, no div-by-zero.
     assert est.basis == "static"
 
 
 def test_estimate_historical_count_zero_is_zero():
-    history = [
-        RunCostSample(count=10, stage_costs={s: 1.0 for s in STAGES}) for _ in range(3)
-    ]
+    history = [_sample(10, stage_costs={s: 1.0 for s in STAGES}) for _ in range(3)]
     est = estimate_run_cost(0, history)
     assert est.basis == "historical"
     assert est.total_usd == 0.0
+
+
+# ---------------------------------------------------------------------------
+# pack/unpack_stage_usage — the persisted JSON shape + legacy detection
+# ---------------------------------------------------------------------------
+
+
+def test_pack_stage_usage_tagged_shape():
+    out = pack_stage_usage(
+        {"discovery": 0.1, "matching": 0.2, "drafting": 0.3},
+        {"discovery": 5, "matching": 4, "drafting": 3},
+    )
+    assert out == {
+        "costs": {"discovery": 0.1, "matching": 0.2, "drafting": 0.3},
+        "counts": {"discovery": 5, "matching": 4, "drafting": 3},
+    }
+
+
+def test_pack_unpack_round_trip():
+    costs = {"discovery": 0.01, "matching": 0.02, "drafting": 0.03}
+    counts = {"discovery": 9, "matching": 7, "drafting": 5}
+    got_costs, got_counts = unpack_stage_usage(pack_stage_usage(costs, counts))
+    assert got_costs == costs
+    assert got_counts == counts
+
+
+def test_unpack_legacy_bare_costs_yields_empty_counts():
+    # A pre-existing row is the bare {stage: float} map with no tag keys.
+    legacy = {"discovery": 0.01, "matching": 0.02, "drafting": 0.03}
+    costs, counts = unpack_stage_usage(legacy)
+    assert costs == legacy
+    assert counts == {}
+
+
+def test_unpack_tagged_with_missing_counts_key_is_empty():
+    # Defensive: a tagged value missing one sub-key returns the empty side.
+    costs, counts = unpack_stage_usage({"costs": {"discovery": 1.0}})
+    assert costs == {"discovery": 1.0}
+    assert counts == {}
+
+
+# ---------------------------------------------------------------------------
+# estimate_run_cost — per-stage realized-count rate math
+# ---------------------------------------------------------------------------
+
+
+def test_estimate_divides_each_stage_by_its_realized_count():
+    # A budget-stopped run: discovery/matching processed 10 profs but only 2 were
+    # drafted. Each stage's rate must divide by ITS realized count, not by `count`.
+    history = [
+        _sample(
+            10,
+            stage_costs={"discovery": 1.0, "matching": 2.0, "drafting": 4.0},
+            stage_counts={"discovery": 10, "matching": 10, "drafting": 2},
+        )
+        for _ in range(3)
+    ]
+    est = estimate_run_cost(10, history)
+    assert est.basis == "historical"
+    by_stage = {s.stage: s.cost_usd for s in est.stages}
+    # discovery: $3/30 profs = $0.10/prof * 10 = $1.00.
+    assert abs(by_stage["discovery"] - 1.0) < 1e-12
+    # matching: $6/30 = $0.20/prof * 10 = $2.00.
+    assert abs(by_stage["matching"] - 2.0) < 1e-12
+    # drafting: $12 / 6 realized = $2.00/prof * 10 = $20.00 (NOT $12/30 = $0.40).
+    assert abs(by_stage["drafting"] - 20.0) < 1e-12
+
+
+def test_short_partial_runs_do_not_drag_below_full_runs():
+    # Several short (1-prof) drafting runs vs equivalent full runs must yield the
+    # SAME drafting rate, because we divide by realized drafting count (1), not by
+    # the requested count. Old code divided by requested count and understated it.
+    short_runs = [
+        _sample(
+            10,
+            stage_costs={"discovery": 0.0, "matching": 0.0, "drafting": 2.0},
+            stage_counts={"discovery": 10, "matching": 10, "drafting": 1},
+        )
+        for _ in range(3)
+    ]
+    est = estimate_run_cost(10, short_runs)
+    drafting = next(s for s in est.stages if s.stage == "drafting")
+    # Realized rate = $6 / 3 drafted = $2.00/prof -> 10 profs = $20.
+    assert abs(drafting.cost_usd - 20.0) < 1e-12
+
+
+def test_per_stage_fallback_when_one_stage_lacks_realized_counts():
+    # Discovery + matching have 3 count-bearing samples; drafting has 0 (each run
+    # stopped before drafting). Drafting falls back to STATIC; the others go
+    # historical. basis is "historical" because at least one stage used real data.
+    history = [
+        _sample(
+            10,
+            stage_costs={"discovery": 1.0, "matching": 1.0, "drafting": 0.0},
+            stage_counts={"discovery": 10, "matching": 10, "drafting": 0},
+        )
+        for _ in range(3)
+    ]
+    est = estimate_run_cost(5, history)
+    assert est.basis == "historical"
+    static = estimate_run_cost(5, [])
+    static_draft = next(s for s in static.stages if s.stage == "drafting").cost_usd
+    draft = next(s for s in est.stages if s.stage == "drafting").cost_usd
+    # Drafting had no realized counts -> identical to the static drafting estimate.
+    assert abs(draft - static_draft) < 1e-12
+    # Discovery/matching used the realized rate ($3/30 = $0.10/prof * 5 = $0.50).
+    disc = next(s for s in est.stages if s.stage == "discovery").cost_usd
+    assert abs(disc - 0.5) < 1e-12
+
+
+def test_mixed_new_and_legacy_history_estimates_without_error():
+    # New rows carry per-stage counts; legacy rows carry none (empty stage_counts).
+    # Legacy rows are excluded per stage but must not crash or skew the rate.
+    history = [
+        _sample(10, stage_costs={s: 1.0 for s in STAGES}),
+        _sample(10, stage_costs={s: 1.0 for s in STAGES}),
+        _sample(10, stage_costs={s: 1.0 for s in STAGES}),
+        _sample(10, stage_costs={s: 999.0 for s in STAGES}, stage_counts={}),  # legacy
+    ]
+    est = estimate_run_cost(10, history)
+    assert est.basis == "historical"
+    # Only the 3 count-bearing rows pool: $3/30 = $0.10/prof * 10 = $1.00/stage.
+    for s in est.stages:
+        assert abs(s.cost_usd - 1.0) < 1e-12
+
+
+def test_all_legacy_history_falls_back_to_static():
+    # Every row is legacy (no realized counts) -> no stage has a usable pool.
+    history = [
+        _sample(10, stage_costs={s: 1.0 for s in STAGES}, stage_counts={}) for _ in range(5)
+    ]
+    est = estimate_run_cost(10, history)
+    assert est.basis == "static"
+    assert est.sample_size == 0
+
+
+def test_full_run_equivalence_matches_legacy_pooled_behavior():
+    # When realized per-stage counts == requested count, the per-stage estimate
+    # must equal the old pooled "sum(cost)/sum(count)" behavior exactly.
+    history = [
+        _sample(n, stage_costs={"discovery": 0.5, "matching": 0.7, "drafting": 1.2})
+        for n in (4, 8, 12)
+    ]
+    est = estimate_run_cost(6, history)
+    assert est.basis == "historical"
+    total_profs = 4 + 8 + 12
+    for stage, per_run_cost in (("discovery", 0.5), ("matching", 0.7), ("drafting", 1.2)):
+        expected = (per_run_cost * 3) / total_profs * 6
+        got = next(s for s in est.stages if s.stage == stage).cost_usd
+        assert abs(got - expected) < 1e-12
 
 
 def test_dataclasses_are_frozen():

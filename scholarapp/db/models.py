@@ -192,8 +192,16 @@ class RunUsage(Base):
     (runs) distinct from its measured spend, and lets the cost engine average a
     fresh history without touching the core pipeline schema.
 
-    `stage_costs` is a JSON object keyed by usage.STAGES so the cost engine can
-    average per-stage history. `total_usd` is stored denormalized for cheap
+    `stage_costs` is a JSON object carrying BOTH the per-stage USD costs AND the
+    per-stage realized professor counts, so the cost engine can divide each
+    stage's spend by the size that stage actually processed (a budget-stopped run
+    drafts fewer than `count`). Because the project has no migrations (create_all
+    cannot ALTER to add a column), the realized counts ride inside this existing
+    JSON column rather than a new one. New rows use the tagged shape
+    {"costs": {stage: float}, "counts": {stage: int}}; pre-existing rows are the
+    legacy bare {stage: float} cost map (no counts). usage.pack_stage_usage /
+    unpack_stage_usage own the encoding + legacy detection — the column itself is
+    schema-agnostic JSON. `total_usd` is stored denormalized for cheap
     newest-first listing without re-summing the JSON in SQL.
     """
 

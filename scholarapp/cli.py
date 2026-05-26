@@ -362,19 +362,29 @@ def _recent_cost_history() -> list[usage_tracker.RunCostSample]:
     """Map persisted RunUsage rows into the estimator's RunCostSample inputs.
 
     The cost engine is a pure function (no DB), so the CLI owns the ORM->sample
-    translation. We read newest-first via repo.list_recent_run_usage and project
-    each row onto (count, stage_costs); estimate_run_cost never raises on an empty
-    or short list, so a first-ever run (no history) cleanly falls back to its
-    static guess. Read inside its own session so nothing leaks past the boundary.
+    translation. We read newest-first via repo.list_recent_run_usage and unpack
+    each row's JSON into (stage_costs, stage_counts); estimate_run_cost never
+    raises on an empty/short/legacy list, so a first-ever run (no history) cleanly
+    falls back to its static guess. Legacy rows unpack with empty stage_counts and
+    are excluded per-stage rather than skewing the realized rate. Read inside its
+    own session so nothing leaks past the boundary.
     """
     with get_session() as session:
         rows = repo.list_recent_run_usage(session)
-        # Materialize the JSON dict fully inside the session — the row's
-        # stage_costs is a plain dict already, but copying keeps us detachment-safe.
-        return [
-            usage_tracker.RunCostSample(count=row.count, stage_costs=dict(row.stage_costs))
-            for row in rows
-        ]
+        # Unpack the tagged JSON value fully inside the session into per-stage
+        # costs + realized counts; legacy rows yield empty counts (handled by the
+        # estimator). row.count is the requested count, kept informational.
+        samples: list[usage_tracker.RunCostSample] = []
+        for row in rows:
+            stage_costs, stage_counts = usage_tracker.unpack_stage_usage(dict(row.stage_costs))
+            samples.append(
+                usage_tracker.RunCostSample(
+                    count=row.count,
+                    stage_costs=stage_costs,
+                    stage_counts=stage_counts,
+                )
+            )
+        return samples
 
 
 def _over_budget(effective_budget: float | None, tracker: usage_tracker.UsageTracker) -> bool:
@@ -388,17 +398,35 @@ def _over_budget(effective_budget: float | None, tracker: usage_tracker.UsageTra
     return effective_budget is not None and tracker.total_cost_usd >= effective_budget
 
 
-def _persist_run_usage(run_id: str, count: int, tracker: usage_tracker.UsageTracker) -> None:
-    """Write this run's realized per-stage cost as one RunUsage row (history).
+def _persist_run_usage(
+    run_id: str, count: int, drafted: int, tracker: usage_tracker.UsageTracker
+) -> None:
+    """Write this run's realized per-stage cost + realized SIZE as one RunUsage row.
 
     Called once at each terminal path of the drafting phase, so a completed run —
-    full or partial — records exactly one row. `total_usd` is summed from the
-    per-stage costs (not tracker.total_cost_usd) so it stays consistent with the
-    stored stage_costs, which deliberately exclude one-off ingestion parsing.
-    Future runs feed these rows back through _recent_cost_history to sharpen the
-    estimate. Stage vocabulary is owned by usage.STAGES; we don't redefine it.
+    full or partial — records exactly one row. Besides the per-stage cost, we now
+    record the realized professor count each stage actually processed, so future
+    estimates divide each stage's spend by the size that produced it (a budget-
+    stopped run drafts fewer than `count`; dividing by `count` would understate
+    the rate). Realized per-stage counts:
+      discovery = professors persisted for the run,
+      matching  = professors with >=1 matched project,
+      drafting  = professors actually drafted (`drafted`; 0 on nothing-to-draft).
+    `count` (the requested size) is still stored for context but no longer drives
+    the rate math. `total_usd` is summed from the per-stage costs (not
+    tracker.total_cost_usd) so it stays consistent with the stored stage_costs,
+    which deliberately exclude one-off ingestion parsing. Stage vocabulary is
+    owned by usage.STAGES; we don't redefine it.
     """
     stage_costs = usage_tracker.stage_costs_from_tracker(tracker)
+    with get_session() as session:
+        discovered = len(repo.list_professors_for_run(session, run_id))
+    matched = _count_professors_with_matches(run_id)
+    stage_counts: dict[str, int] = {
+        "discovery": discovered,
+        "matching": matched,
+        "drafting": drafted,
+    }
     with get_session() as session:
         repo.add_run_usage(
             session,
@@ -406,6 +434,7 @@ def _persist_run_usage(run_id: str, count: int, tracker: usage_tracker.UsageTrac
             count=count,
             total_usd=sum(stage_costs.values()),
             stage_costs=stage_costs,
+            stage_counts=stage_counts,
         )
 
 
@@ -904,7 +933,8 @@ def run(
             ui.warn("No professors with matched projects — nothing to draft.")
             # Still a completed run — record its (mostly ingestion/discovery) spend
             # so it counts as history exactly once, like any other terminal path.
-            _persist_run_usage(run_id, count, tracker)
+            # Nothing was drafted, so the drafting stage's realized count is 0.
+            _persist_run_usage(run_id, count, 0, tracker)
             if stop_reason == "budget" and effective_budget is not None:
                 budget_stop.append((effective_budget, tracker.total_cost_usd))
             return
@@ -941,8 +971,10 @@ def run(
 
         # Record realized cost once the run completes — this is the history that
         # sharpens future estimates. Written here (not in a finally) so a failed/
-        # aborted/refused run leaves no misleading sample.
-        _persist_run_usage(run_id, count, tracker)
+        # aborted/refused run leaves no misleading sample. The drafting stage's
+        # realized count is the number actually drafted (a budget/partial run
+        # drafts fewer than `count`).
+        _persist_run_usage(run_id, count, len(email_drafts), tracker)
         if stop_reason == "budget" and effective_budget is not None:
             budget_stop.append((effective_budget, tracker.total_cost_usd))
 
