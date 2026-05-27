@@ -310,6 +310,26 @@ def test_estimate_static_scales_with_count():
     assert big.total_usd > small.total_usd
 
 
+def test_estimate_static_pins_exact_per_stage_dollars():
+    # Lock the static constants in place with concrete dollar literals (NOT derived
+    # from the constants — that would be tautological). For N=10 the documented
+    # formula is per-stage = _STATIC_PER_PROF_USD[stage] * 10, plus the once-per-run
+    # _STATIC_FIXED_USD discovery add-on:
+    #   discovery = 0.0045 * 10 + 0.0030 = 0.048
+    #   matching  = 0.0060 * 10          = 0.060
+    #   drafting  = 0.0180 * 10          = 0.180
+    #   total                            = 0.288
+    est = estimate_run_cost(10, [])
+    assert est.basis == "static"
+    assert est.sample_size == 0
+    assert est.count == 10
+    by_stage = {s.stage: s.cost_usd for s in est.stages}
+    assert abs(by_stage["discovery"] - 0.048) < 1e-12
+    assert abs(by_stage["matching"] - 0.060) < 1e-12
+    assert abs(by_stage["drafting"] - 0.180) < 1e-12
+    assert abs(est.total_usd - 0.288) < 1e-12
+
+
 def test_estimate_static_below_min_samples_stays_static():
     # Two count-bearing samples is below the threshold -> still static.
     history = [_sample(10, stage_costs={s: 1.0 for s in STAGES}) for _ in range(2)]

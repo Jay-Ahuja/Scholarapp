@@ -586,7 +586,7 @@ def run(
         # is NOT rejected here — it naturally trips the refuse-to-start check below
         # since estimate.total_usd > 0. We reject only non-finite (NaN/±inf, which
         # math.isfinite catches) and negative values, which can't be real budgets.
-        # config.py's _env_float deliberately does NOT raise on these so unrelated
+        # config.py's _parse_float deliberately does NOT raise on these so unrelated
         # commands (list, init) that load_settings() don't crash on a bad env value;
         # the policy lives here, gating only the spending path. ConfigError is the
         # existing error model — _run_safely renders it as ui.error + Exit(1).

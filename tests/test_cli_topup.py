@@ -31,7 +31,7 @@ from scholarapp.cli import app
 from scholarapp.db import repo
 from scholarapp.db.models import RunStatus
 from scholarapp.db.session import get_session
-from scholarapp.errors import DiscoveryError
+from scholarapp.errors import DiscoveryError, DraftingError
 from scholarapp.modules import discovery, drafting, ingestion, matching
 
 
@@ -1546,3 +1546,173 @@ def test_refused_run_writes_no_run_usage_row(e2e_setup, monkeypatch):
     assert result.exit_code == 1, result.output
     with get_session() as session:
         assert repo.list_recent_run_usage(session) == []
+
+
+# ---------------------------------------------------------------------------
+# Budget-stop partial delivery with N>1 matched professors
+# ---------------------------------------------------------------------------
+
+
+def test_budget_crossed_with_multiple_matched_drafts_all_matched(e2e_setup, monkeypatch):
+    """Ceiling trips after >=2 already matched ⇒ partial delivery drafts all of them.
+
+    Requested count is 5; the initial pass matches 2 (`a`, `b`) of the 5 discovered.
+    Initial discovery ($1.00) + initial matching ($0.50) == $1.50 hits the $1.50
+    ceiling, so the top-up boundary check trips with have=2 and the loop breaks.
+    Partial delivery then drafts BOTH matched professors (the existing budget-stop
+    tests only ever exercise a single matched professor).
+    """
+    from scholarapp import usage
+
+    inputs = e2e_setup["inputs"]
+    _mock_ingestion(monkeypatch, count=5)
+
+    fake_disc = _CostingDiscovery(pool=["a", "b", "c", "d", "e"], dollars_per_call=1.0)
+    fake_match = _CostingMatching(qualifying={"a", "b"}, dollars_per_call=0.5)
+    fake_draft = _CostingDrafting(dollars_per_call=0.1)
+    monkeypatch.setattr(discovery, "find_professors", fake_disc)
+    monkeypatch.setattr(matching, "match_projects_for_run", fake_match)
+    monkeypatch.setattr(drafting, "draft_emails_for_run", fake_draft)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["run", "--inputs", str(inputs), "--budget", "1.50", "--yes"]
+    )
+
+    assert result.exit_code == 0, result.output
+    # Only the initial discovery ran — the ceiling broke the top-up loop.
+    assert len(fake_disc.calls) == 1
+    # Both matched professors were drafted in a single drafting call.
+    assert fake_draft.request_counts == [2]
+    assert "Budget reached during top-up" in result.output
+
+    with get_session() as session:
+        run = _the_run(session)
+        assert run.status == RunStatus.REVIEW
+        assert len(repo.list_drafts_for_run(session, run.id)) == 2
+        rows = repo.list_recent_run_usage(session)
+        assert len(rows) == 1
+        _, counts = usage.unpack_stage_usage(rows[0].stage_costs)
+        # Realized drafting count is the 2 actually drafted, not the requested 5.
+        assert counts["drafting"] == 2
+
+
+# ---------------------------------------------------------------------------
+# RUN_MAX_USD=<non-numeric> through `run` ⇒ clean ConfigError, no traceback
+# ---------------------------------------------------------------------------
+
+
+def test_run_max_usd_non_numeric_renders_clean_error(e2e_setup, monkeypatch):
+    """A genuinely non-numeric RUN_MAX_USD hard-stops `run` with a friendly message.
+
+    nan/inf/-5 all parse via float() and are unit-tested elsewhere; a value that
+    fails float() parsing (`abc`) must surface as the controlled config message —
+    exit 1, no Python traceback — when `run` reads the ceiling.
+    """
+    inputs = e2e_setup["inputs"]
+    fake_disc, _, fake_draft = _install_fakes(
+        monkeypatch, count=2, pool=["a", "b"], qualifying={"a", "b"}
+    )
+    monkeypatch.setenv("RUN_MAX_USD", "abc")
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["run", "--inputs", str(inputs), "--yes"])
+
+    assert result.exit_code == 1, result.output
+    # The controlled ConfigError message, not a raw float() ValueError.
+    assert "RUN_MAX_USD must be a number" in result.output
+    assert "abc" in result.output
+    # No traceback leaked: ScholarError is caught and rendered via ui.error.
+    assert "Traceback" not in result.output
+    # The bad ceiling stops the run before any paid stage.
+    assert fake_disc.calls == []
+    assert fake_draft.request_counts == []
+
+
+# ---------------------------------------------------------------------------
+# A FAILED drafting run writes no RunUsage history sample
+# ---------------------------------------------------------------------------
+
+
+def test_failed_drafting_run_writes_no_run_usage_row(e2e_setup, monkeypatch):
+    """Drafting raising a ScholarError ⇒ run FAILED, exit 1, no history sample.
+
+    The refused/declined no-row cases are covered; this pins the FAILED path: a
+    crash during drafting must not leave a misleading RunUsage sample behind.
+    """
+    inputs = e2e_setup["inputs"]
+
+    class _RaisingDrafting(_FakeDrafting):
+        async def __call__(self, **kwargs: Any) -> list[drafting.EmailDraft]:
+            raise DraftingError("Anthropic returned 500 during drafting.")
+
+    _mock_ingestion(monkeypatch, count=2)
+    fake_disc = _FakeDiscovery(pool=["a", "b"])
+    fake_match = _FakeMatching(qualifying={"a", "b"})
+    fake_draft = _RaisingDrafting()
+    monkeypatch.setattr(discovery, "find_professors", fake_disc)
+    monkeypatch.setattr(matching, "match_projects_for_run", fake_match)
+    monkeypatch.setattr(drafting, "draft_emails_for_run", fake_draft)
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["run", "--inputs", str(inputs), "--yes"])
+
+    assert result.exit_code == 1, result.output
+
+    with get_session() as session:
+        run = _the_run(session)
+        assert run.status == RunStatus.FAILED
+        # No drafts persisted and — crucially — no history sample written.
+        assert repo.list_drafts_for_run(session, run.id) == []
+        assert repo.list_recent_run_usage(session) == []
+
+
+# ---------------------------------------------------------------------------
+# Historical-basis feedback loop end-to-end
+# ---------------------------------------------------------------------------
+
+
+def test_historical_basis_estimate_after_enough_priced_runs(e2e_setup, monkeypatch):
+    """Once enough completed priced runs exist, a later run estimates HISTORICALLY.
+
+    The first run writes a count-bearing RunUsage sample (all stages realized 2
+    professors). With _MIN_HISTORY_SAMPLES monkeypatched down to 1, the second
+    run's pre-flight estimate crosses the threshold and renders the historical
+    basis wording ("based on the last N run(s)") instead of the static guess —
+    exercising _recent_cost_history's ORM->RunCostSample unpack end-to-end.
+    """
+    from scholarapp import usage
+
+    inputs = e2e_setup["inputs"]
+    # Small threshold so a single completed run is enough — fast and non-flaky.
+    monkeypatch.setattr(usage, "_MIN_HISTORY_SAMPLES", 1)
+
+    def _install_costing() -> _CostingDrafting:
+        fake_disc = _CostingDiscovery(pool=["a", "b"], dollars_per_call=0.2)
+        fake_match = _CostingMatching(qualifying={"a", "b"}, dollars_per_call=0.3)
+        fake_draft = _CostingDrafting(dollars_per_call=0.4)
+        monkeypatch.setattr(discovery, "find_professors", fake_disc)
+        monkeypatch.setattr(matching, "match_projects_for_run", fake_match)
+        monkeypatch.setattr(drafting, "draft_emails_for_run", fake_draft)
+        return fake_draft
+
+    runner = CliRunner()
+
+    # First run: no history yet ⇒ static basis, and it persists one sample.
+    _mock_ingestion(monkeypatch, count=2)
+    first_draft = _install_costing()
+    first = runner.invoke(app, ["run", "--inputs", str(inputs), "--yes"])
+    assert first.exit_code == 0, first.output
+    assert "static estimate" in first.output
+    assert first_draft.request_counts == [2]
+    with get_session() as session:
+        assert len(repo.list_recent_run_usage(session)) == 1
+
+    # Second run: one count-bearing prior sample crosses the (patched) threshold,
+    # so the estimate panel must now read the historical-basis wording.
+    _mock_ingestion(monkeypatch, count=2)
+    _install_costing()
+    second = runner.invoke(app, ["run", "--inputs", str(inputs), "--yes"])
+    assert second.exit_code == 0, second.output
+    assert "based on the last 1 run" in second.output
+    assert "static estimate" not in second.output

@@ -342,10 +342,18 @@ def test_run_max_usd_nan_parses_through(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_unread_malformed_setting_does_not_block_other_commands(tmp_path, monkeypatch):
-    """RUN_MAX_USD=abc must not break commands that never read run_max_usd."""
+@pytest.mark.parametrize("command", ["list", "init"])
+def test_unread_malformed_setting_does_not_block_other_commands(
+    tmp_path, monkeypatch, command
+):
+    """RUN_MAX_USD=abc must not break commands that never read run_max_usd.
+
+    Both `list` and `init` load_settings() but never touch run_max_usd, so the
+    lazy ConfigError never fires for them — only `run` (which reads the ceiling)
+    surfaces it.
+    """
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     monkeypatch.setenv("RUN_MAX_USD", "abc")
     runner = CliRunner()
-    result = runner.invoke(app, ["list"])
+    result = runner.invoke(app, [command])
     assert result.exit_code == 0, result.stdout
