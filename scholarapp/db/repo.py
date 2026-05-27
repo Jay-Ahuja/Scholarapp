@@ -24,9 +24,11 @@ from scholarapp.db.models import (
     ResumeCache,
     Run,
     RunStatus,
+    RunUsage,
     SendLog,
     SendOutcome,
 )
+from scholarapp.usage import pack_stage_usage
 
 # ---------------------------------------------------------------------------
 # Run
@@ -269,3 +271,42 @@ def get_cached_resume(session: Session, sha256: str) -> dict | None:
 def cache_resume(session: Session, sha256: str, parsed_json: dict) -> None:
     """Insert-or-replace the parsed resume keyed by content hash."""
     session.merge(ResumeCache(sha256=sha256, parsed_json=parsed_json))
+
+
+# ---------------------------------------------------------------------------
+# RunUsage — realized per-run cost, used as cost-estimation history
+# ---------------------------------------------------------------------------
+
+
+def add_run_usage(
+    session: Session,
+    *,
+    run_id: str,
+    count: int,
+    total_usd: float,
+    stage_costs: dict[str, float],
+    stage_counts: dict[str, int],
+) -> RunUsage:
+    """Persist one run's realized cost history.
+
+    The per-stage costs AND the per-stage realized professor counts are packed
+    into the single `stage_costs` JSON column via usage.pack_stage_usage (the
+    project has no migrations, so we can't add a column for the counts). The
+    estimator divides each stage's pooled spend by its pooled realized count, so
+    a budget-stopped run's smaller drafting size is recorded honestly here.
+    """
+    usage = RunUsage(
+        run_id=run_id,
+        count=count,
+        total_usd=total_usd,
+        stage_costs=pack_stage_usage(stage_costs, stage_counts),
+    )
+    session.add(usage)
+    session.flush()
+    return usage
+
+
+def list_recent_run_usage(session: Session, *, limit: int = 20) -> list[RunUsage]:
+    """Newest first. Caller feeds these into the cost estimator as history."""
+    stmt = select(RunUsage).order_by(RunUsage.created_at.desc()).limit(limit)
+    return list(session.scalars(stmt))

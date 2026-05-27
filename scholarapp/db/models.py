@@ -22,7 +22,8 @@ import uuid
 from datetime import UTC, datetime
 from enum import Enum
 
-from sqlalchemy import JSON, Enum as SAEnum, ForeignKey, Text
+from sqlalchemy import JSON, ForeignKey, Text
+from sqlalchemy import Enum as SAEnum
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -180,6 +181,38 @@ class SendLog(Base):
     outcome: Mapped[SendOutcome] = mapped_column(_enum_col(SendOutcome))
     error: Mapped[str | None] = mapped_column(Text)
     gmail_message_id: Mapped[str | None]
+
+
+class RunUsage(Base):
+    """Realized per-run cost, written once a run finishes (Step: cost accounting).
+
+    A SEPARATE table — not extra columns on `runs` — because the project has no
+    migrations: db/session.py's idempotent create_all() adds missing tables but
+    cannot ALTER an existing one. Decoupling also keeps a run's input metadata
+    (runs) distinct from its measured spend, and lets the cost engine average a
+    fresh history without touching the core pipeline schema.
+
+    `stage_costs` is a JSON object carrying BOTH the per-stage USD costs AND the
+    per-stage realized professor counts, so the cost engine can divide each
+    stage's spend by the size that stage actually processed (a budget-stopped run
+    drafts fewer than `count`). Because the project has no migrations (create_all
+    cannot ALTER to add a column), the realized counts ride inside this existing
+    JSON column rather than a new one. New rows use the tagged shape
+    {"costs": {stage: float}, "counts": {stage: int}}; pre-existing rows are the
+    legacy bare {stage: float} cost map (no counts). usage.pack_stage_usage /
+    unpack_stage_usage own the encoding + legacy detection — the column itself is
+    schema-agnostic JSON. `total_usd` is stored denormalized for cheap
+    newest-first listing without re-summing the JSON in SQL.
+    """
+
+    __tablename__ = "run_usage"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    run_id: Mapped[str] = mapped_column(ForeignKey("runs.id"), index=True)
+    created_at: Mapped[datetime] = mapped_column(default=_utcnow)
+    count: Mapped[int]
+    total_usd: Mapped[float]
+    stage_costs: Mapped[dict] = mapped_column(JSON)
 
 
 class ResumeCache(Base):

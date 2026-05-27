@@ -23,14 +23,28 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+from click.testing import _NamedTextIOWrapper
 from typer.testing import CliRunner
 
 from scholarapp.cli import app
 from scholarapp.db import repo
 from scholarapp.db.models import RunStatus
 from scholarapp.db.session import get_session
-from scholarapp.errors import DiscoveryError
+from scholarapp.errors import DiscoveryError, DraftingError
 from scholarapp.modules import discovery, drafting, ingestion, matching
+
+
+def _force_tty(monkeypatch) -> None:
+    """Make `sys.stdin.isatty()` return True inside CliRunner.
+
+    CliRunner isolates stdin to a click `_NamedTextIOWrapper` whose isatty() is
+    always False, so the CLI's interactive-confirm branch would never fire under
+    test. Patching the wrapper class's isatty lets us exercise the prompt path
+    (and prove --yes skips it) while still feeding answers via `input=`.
+    """
+    monkeypatch.setattr(_NamedTextIOWrapper, "isatty", lambda self: True)
+
 
 # ---------------------------------------------------------------------------
 # Fakes for the three module boundaries
@@ -829,3 +843,979 @@ def test_topup_discovery_error_breaks_then_partial_delivery(e2e_setup, monkeypat
         assert run.status == RunStatus.REVIEW
         drafts = repo.list_drafts_for_run(session, run.id)
     assert len(drafts) == 1
+
+
+# ===========================================================================
+# Cost estimate, confirmation, --budget ceiling, and RunUsage persistence
+#
+# These exercise the pre-flight gate (estimate panel + confirm/refuse) and the
+# mid-run budget break that drops into partial delivery, plus the single
+# RunUsage row written per completed run. The fakes here additionally RECORD
+# Claude usage via usage.record(...) so tracker.total_cost_usd is non-zero and
+# the budget boundary checks have something to trip on — the topup fakes above
+# never spend, so they model "free" runs that never hit a ceiling.
+#
+# Token→cost: haiku input is $1e-6/token, so 1_000_000 input tokens == $1.00.
+# We pick per-call token counts that make each stage cost an exact round dollar
+# figure, so budget thresholds in the assertions are unambiguous.
+# ===========================================================================
+
+
+class _Usage:
+    """Minimal stand-in for an Anthropic response.usage object."""
+
+    def __init__(self, input_tokens: int) -> None:
+        self.input_tokens = input_tokens
+        self.cache_creation_input_tokens = 0
+        self.cache_read_input_tokens = 0
+        self.output_tokens = 0
+
+
+def _record(label: str, input_tokens: int) -> None:
+    """Record one haiku call against the CLI-installed tracker (contextvar).
+
+    Uses haiku ($1e-6/input token) so cost == input_tokens * 1e-6. The CLI
+    installs the tracker for the duration of `scholar run`; asyncio.run copies
+    the current context into the coroutine, so a record() from inside an async
+    fake lands on that same tracker.
+    """
+    from scholarapp import usage
+
+    usage.record(label, "claude-haiku-4-5", _Usage(input_tokens))
+
+
+class _CostingDiscovery(_FakeDiscovery):
+    """_FakeDiscovery that records a fixed discovery cost per call.
+
+    `dollars_per_call` is charged under the "extract_email" label (→ discovery
+    stage) on every discovery invocation, so each pass advances spend by a known
+    amount and the between-stage budget checks have a real total to compare.
+    """
+
+    def __init__(self, pool: list[str], dollars_per_call: float) -> None:
+        super().__init__(pool)
+        self.dollars_per_call = dollars_per_call
+
+    async def __call__(self, **kwargs: Any) -> discovery.DiscoveryResult:
+        _record("extract_email", int(self.dollars_per_call * 1_000_000))
+        return await super().__call__(**kwargs)
+
+
+class _CostingMatching(_FakeMatching):
+    """_FakeMatching that records a fixed matching cost per call."""
+
+    def __init__(self, qualifying: set[str], dollars_per_call: float) -> None:
+        super().__init__(qualifying)
+        self.dollars_per_call = dollars_per_call
+
+    async def __call__(self, **kwargs: Any) -> list[list[matching.MatchedProject]]:
+        _record("match_projects", int(self.dollars_per_call * 1_000_000))
+        return await super().__call__(**kwargs)
+
+
+class _CostingDrafting(_FakeDrafting):
+    """_FakeDrafting that records a fixed drafting cost per call."""
+
+    def __init__(self, dollars_per_call: float) -> None:
+        super().__init__()
+        self.dollars_per_call = dollars_per_call
+
+    async def __call__(self, **kwargs: Any) -> list[drafting.EmailDraft]:
+        _record("draft_email", int(self.dollars_per_call * 1_000_000))
+        return await super().__call__(**kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Estimate panel + confirmation prompt
+# ---------------------------------------------------------------------------
+
+
+def test_estimate_panel_shown_before_discover_and_noninteractive_proceeds(
+    e2e_setup, monkeypatch
+):
+    """The estimate panel renders before Discover; no TTY ⇒ no prompt, run proceeds.
+
+    CliRunner feeds non-TTY stdin, so the opt-out confirm is skipped entirely and
+    the pipeline runs to completion without hanging.
+    """
+    inputs = e2e_setup["inputs"]
+    _install_fakes(monkeypatch, count=2, pool=["a", "b"], qualifying={"a", "b"})
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["run", "--inputs", str(inputs)])
+
+    assert result.exit_code == 0, result.output
+    # The estimate section header + panel title appear, and they come BEFORE the
+    # Discover section (the gate sits after parse, before discovery).
+    assert "Cost estimate" in result.output
+    assert "Estimated cost" in result.output
+    assert result.output.index("Cost estimate") < result.output.index("Discover")
+    # Static basis on a first-ever run (no history to average yet).
+    assert "static estimate" in result.output
+
+
+def test_confirm_decline_aborts_before_any_paid_work(e2e_setup, monkeypatch):
+    """A declined confirm aborts cleanly: no discovery, no drafts, no RunUsage row.
+
+    We force a TTY (isatty → True) so the prompt fires, then feed "n" to decline.
+    Nothing past parse should run.
+    """
+    inputs = e2e_setup["inputs"]
+    fake_disc, _, fake_draft = _install_fakes(
+        monkeypatch, count=2, pool=["a", "b"], qualifying={"a", "b"}
+    )
+    _force_tty(monkeypatch)
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["run", "--inputs", str(inputs)], input="n\n")
+
+    assert result.exit_code == 0, result.output
+    assert "Aborted." in result.output
+    # Discovery/drafting never ran — declining spends nothing past parse.
+    assert fake_disc.calls == []
+    assert fake_draft.request_counts == []
+
+    with get_session() as session:
+        run = _the_run(session)
+        # The run row was created at parse, but no drafts and no usage row exist.
+        assert repo.list_drafts_for_run(session, run.id) == []
+        assert repo.list_recent_run_usage(session) == []
+
+
+def test_yes_flag_skips_prompt_even_on_a_tty(e2e_setup, monkeypatch):
+    """--yes opts out of the confirm prompt even when stdin is a TTY."""
+    inputs = e2e_setup["inputs"]
+    fake_disc, _, fake_draft = _install_fakes(
+        monkeypatch, count=2, pool=["a", "b"], qualifying={"a", "b"}
+    )
+    _force_tty(monkeypatch)
+
+    runner = CliRunner()
+    # No stdin provided: if the prompt fired, typer.confirm would hit EOF and the
+    # run would not complete cleanly. --yes must skip it.
+    result = runner.invoke(app, ["run", "--inputs", str(inputs), "--yes"])
+
+    assert result.exit_code == 0, result.output
+    assert "Proceed with this run" not in result.output
+    assert fake_draft.request_counts == [2]
+
+
+# ---------------------------------------------------------------------------
+# Refuse-to-start: --budget / RUN_MAX_USD below the estimate
+# ---------------------------------------------------------------------------
+
+
+def test_budget_below_estimate_refuses_to_start(e2e_setup, monkeypatch):
+    """--budget under the estimate exits 1 before discovery; nothing is spent."""
+    inputs = e2e_setup["inputs"]
+    fake_disc, _, fake_draft = _install_fakes(
+        monkeypatch, count=3, pool=["a", "b", "c"], qualifying={"a", "b", "c"}
+    )
+
+    runner = CliRunner()
+    # The static estimate for count=3 is well above $0.0001; refuse-to-start.
+    result = runner.invoke(
+        app, ["run", "--inputs", str(inputs), "--budget", "0.0001", "--yes"]
+    )
+
+    assert result.exit_code == 1, result.output
+    assert "exceeds the budget" in result.output
+    # No discovery, no drafts: the gate fires before any paid stage.
+    assert fake_disc.calls == []
+    assert fake_draft.request_counts == []
+
+    with get_session() as session:
+        run = _the_run(session)
+        assert repo.list_drafts_for_run(session, run.id) == []
+        assert repo.list_recent_run_usage(session) == []
+
+
+def test_run_max_usd_setting_refuses_when_below_estimate(e2e_setup, monkeypatch):
+    """RUN_MAX_USD acts as the ceiling when --budget is absent."""
+    inputs = e2e_setup["inputs"]
+    fake_disc, _, _ = _install_fakes(
+        monkeypatch, count=3, pool=["a", "b", "c"], qualifying={"a", "b", "c"}
+    )
+    monkeypatch.setenv("RUN_MAX_USD", "0.0001")
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["run", "--inputs", str(inputs), "--yes"])
+
+    assert result.exit_code == 1, result.output
+    assert "exceeds the budget" in result.output
+    assert fake_disc.calls == []
+
+
+def test_budget_overrides_run_max_usd(e2e_setup, monkeypatch):
+    """An explicit --budget wins over a stricter RUN_MAX_USD env setting."""
+    inputs = e2e_setup["inputs"]
+    _install_fakes(monkeypatch, count=2, pool=["a", "b"], qualifying={"a", "b"})
+    # RUN_MAX_USD would refuse, but a generous --budget overrides and allows it.
+    monkeypatch.setenv("RUN_MAX_USD", "0.0001")
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["run", "--inputs", str(inputs), "--budget", "100", "--yes"]
+    )
+
+    assert result.exit_code == 0, result.output
+    with get_session() as session:
+        run = _the_run(session)
+        assert len(repo.list_drafts_for_run(session, run.id)) == 2
+
+
+# ---------------------------------------------------------------------------
+# Malformed budget ceilings: non-finite (NaN/±inf) and negative are rejected
+# identically whether they arrive via --budget or RUN_MAX_USD. A rejection is a
+# fail-closed hard-stop: clean error, exit 1, and NOTHING past parse runs (no
+# discovery, no drafts, no RunUsage row).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("bad", ["nan", "inf", "-inf", "-5"])
+def test_malformed_budget_flag_hard_stops(e2e_setup, monkeypatch, bad):
+    """--budget {nan,inf,-inf,-5} hard-stops before any paid work."""
+    inputs = e2e_setup["inputs"]
+    fake_disc, _, fake_draft = _install_fakes(
+        monkeypatch, count=3, pool=["a", "b", "c"], qualifying={"a", "b", "c"}
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["run", "--inputs", str(inputs), "--budget", bad, "--yes"]
+    )
+
+    assert result.exit_code == 1, result.output
+    # The error names the malformed value and the source knob, and is NOT the
+    # refuse-to-start ("exceeds the budget") message — this is a validation stop.
+    assert "Invalid budget ceiling" in result.output
+    assert "--budget" in result.output
+    assert "exceeds the budget" not in result.output
+    # Nothing past parse ran: the gate sits before discovery/drafting.
+    assert fake_disc.calls == []
+    assert fake_draft.request_counts == []
+
+    with get_session() as session:
+        run = _the_run(session)
+        assert repo.list_drafts_for_run(session, run.id) == []
+        assert repo.list_recent_run_usage(session) == []
+
+
+@pytest.mark.parametrize("bad", ["nan", "inf", "-inf", "-5"])
+def test_malformed_run_max_usd_hard_stops(e2e_setup, monkeypatch, bad):
+    """RUN_MAX_USD {nan,inf,-inf,-5} hard-stops identically to --budget."""
+    inputs = e2e_setup["inputs"]
+    fake_disc, _, fake_draft = _install_fakes(
+        monkeypatch, count=3, pool=["a", "b", "c"], qualifying={"a", "b", "c"}
+    )
+    monkeypatch.setenv("RUN_MAX_USD", bad)
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["run", "--inputs", str(inputs), "--yes"])
+
+    assert result.exit_code == 1, result.output
+    # Same validation message, but the source knob is now the env var, proving the
+    # single convergence-point check polices both channels the same way.
+    assert "Invalid budget ceiling" in result.output
+    assert "RUN_MAX_USD" in result.output
+    assert "exceeds the budget" not in result.output
+    assert fake_disc.calls == []
+    assert fake_draft.request_counts == []
+
+    with get_session() as session:
+        run = _the_run(session)
+        assert repo.list_drafts_for_run(session, run.id) == []
+        assert repo.list_recent_run_usage(session) == []
+
+
+def test_zero_budget_flag_is_valid_and_refuses_to_start(e2e_setup, monkeypatch):
+    """--budget 0 is a legitimate ceiling: it refuses to run, NOT a validation error.
+
+    A zero ceiling is below any positive estimate, so it trips the existing
+    refuse-to-start check ("exceeds the budget") — it must NOT be treated as
+    malformed input.
+    """
+    inputs = e2e_setup["inputs"]
+    fake_disc, _, _ = _install_fakes(
+        monkeypatch, count=3, pool=["a", "b", "c"], qualifying={"a", "b", "c"}
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["run", "--inputs", str(inputs), "--budget", "0", "--yes"]
+    )
+
+    assert result.exit_code == 1, result.output
+    assert "exceeds the budget" in result.output
+    assert "Invalid budget ceiling" not in result.output
+    assert fake_disc.calls == []
+
+
+def test_zero_run_max_usd_is_valid_and_refuses_to_start(e2e_setup, monkeypatch):
+    """RUN_MAX_USD=0 is a legitimate ceiling that refuses to run (not malformed)."""
+    inputs = e2e_setup["inputs"]
+    fake_disc, _, _ = _install_fakes(
+        monkeypatch, count=3, pool=["a", "b", "c"], qualifying={"a", "b", "c"}
+    )
+    monkeypatch.setenv("RUN_MAX_USD", "0")
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["run", "--inputs", str(inputs), "--yes"])
+
+    assert result.exit_code == 1, result.output
+    assert "exceeds the budget" in result.output
+    assert "Invalid budget ceiling" not in result.output
+    assert fake_disc.calls == []
+
+
+def test_unset_budget_runs_unbounded(e2e_setup, monkeypatch):
+    """No --budget and no RUN_MAX_USD ⇒ effective_budget is None ⇒ unbounded run."""
+    inputs = e2e_setup["inputs"]
+    monkeypatch.delenv("RUN_MAX_USD", raising=False)
+    _, _, fake_draft = _install_fakes(
+        monkeypatch, count=2, pool=["a", "b"], qualifying={"a", "b"}
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["run", "--inputs", str(inputs), "--yes"])
+
+    assert result.exit_code == 0, result.output
+    assert "Invalid budget ceiling" not in result.output
+    assert fake_draft.request_counts == [2]
+
+
+def test_valid_positive_budget_runs_as_before(e2e_setup, monkeypatch):
+    """A generous finite, positive --budget is accepted and the run completes."""
+    inputs = e2e_setup["inputs"]
+    _, _, fake_draft = _install_fakes(
+        monkeypatch, count=2, pool=["a", "b"], qualifying={"a", "b"}
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["run", "--inputs", str(inputs), "--budget", "100", "--yes"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Invalid budget ceiling" not in result.output
+    assert fake_draft.request_counts == [2]
+
+
+# ---------------------------------------------------------------------------
+# Mid-run ceiling crossed → partial delivery + budget-named summary
+# ---------------------------------------------------------------------------
+
+
+def test_budget_crossed_during_topup_partial_delivery(e2e_setup, monkeypatch):
+    """Ceiling crossed mid-run ⇒ stop topping up, draft what matched, name budget.
+
+    Each discovery pass records $1.00. The initial pass matches 1 of 3, so a
+    top-up would be needed; but spend ($1.00 after the initial discovery, then
+    matching/drafting add more) crosses a $1.50 ceiling before/at the first
+    top-up boundary, so the loop breaks and we deliver the 1 matched professor.
+    """
+    inputs = e2e_setup["inputs"]
+    _mock_ingestion(monkeypatch, count=3)
+
+    fake_disc = _CostingDiscovery(pool=["a", "b", "c", "d", "e"], dollars_per_call=1.0)
+    fake_match = _CostingMatching(qualifying={"a", "d", "e"}, dollars_per_call=0.5)
+    fake_draft = _CostingDrafting(dollars_per_call=0.1)
+    monkeypatch.setattr(discovery, "find_professors", fake_disc)
+    monkeypatch.setattr(matching, "match_projects_for_run", fake_match)
+    monkeypatch.setattr(drafting, "draft_emails_for_run", fake_draft)
+
+    runner = CliRunner()
+    # Initial discovery ($1.00) + initial matching ($0.50) == $1.50 ⇒ the top-up
+    # boundary check (>= ceiling) trips and the loop stops at 1 matched professor.
+    result = runner.invoke(
+        app, ["run", "--inputs", str(inputs), "--budget", "1.50", "--yes"]
+    )
+
+    assert result.exit_code == 0, result.output
+    # Only the initial discovery ran — no top-up pass after the ceiling was hit.
+    assert len(fake_disc.calls) == 1
+    # Partial delivery drafted the single matched professor.
+    assert fake_draft.request_counts == [1]
+    # The break happened at the TOP-UP boundary (the loop's pre-pass budget check),
+    # not merely at the pre-draft check — prove the loop itself stopped early.
+    assert "Budget reached during top-up" in result.output
+    # The end-of-run summary names the budget stop (spent vs. budget).
+    assert "budget reached" in result.output.lower()
+
+    with get_session() as session:
+        run = _the_run(session)
+        assert run.status == RunStatus.REVIEW
+        assert len(repo.list_drafts_for_run(session, run.id)) == 1
+
+
+def test_partial_run_records_realized_not_requested_counts(e2e_setup, monkeypatch):
+    """A budget-stopped run records the REALIZED per-stage size, not `count`=3.
+
+    Drafting realized count must be the number actually drafted (1), so future
+    estimates divide drafting spend by 1 — not by the requested 3 — and don't
+    understate the drafting rate.
+    """
+    from scholarapp import usage
+
+    inputs = e2e_setup["inputs"]
+    _mock_ingestion(monkeypatch, count=3)
+
+    fake_disc = _CostingDiscovery(pool=["a", "b", "c", "d", "e"], dollars_per_call=1.0)
+    fake_match = _CostingMatching(qualifying={"a", "d", "e"}, dollars_per_call=0.5)
+    fake_draft = _CostingDrafting(dollars_per_call=0.1)
+    monkeypatch.setattr(discovery, "find_professors", fake_disc)
+    monkeypatch.setattr(matching, "match_projects_for_run", fake_match)
+    monkeypatch.setattr(drafting, "draft_emails_for_run", fake_draft)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["run", "--inputs", str(inputs), "--budget", "1.50", "--yes"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert fake_draft.request_counts == [1]  # only 1 professor was drafted
+
+    with get_session() as session:
+        run = _the_run(session)
+        rows = repo.list_recent_run_usage(session)
+        assert len(rows) == 1
+        # The requested count is preserved as-is...
+        assert rows[0].count == 3
+        _, counts = usage.unpack_stage_usage(rows[0].stage_costs)
+        # ...but the realized drafting count is what was actually drafted (1),
+        # NOT the requested 3. Discovery persisted only the initial pass's profs.
+        n_profs = len(repo.list_professors_for_run(session, run.id))
+        assert counts["discovery"] == n_profs
+        assert counts["matching"] == 1  # only `a` matched before the budget broke
+        assert counts["drafting"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Exactly one RunUsage row per completed run
+# ---------------------------------------------------------------------------
+
+
+def test_completed_run_writes_exactly_one_run_usage_row(e2e_setup, monkeypatch):
+    """A full run persists one RunUsage row with per-stage costs keyed by STAGES."""
+    from scholarapp import usage
+
+    inputs = e2e_setup["inputs"]
+    _mock_ingestion(monkeypatch, count=2)
+
+    fake_disc = _CostingDiscovery(pool=["a", "b"], dollars_per_call=0.2)
+    fake_match = _CostingMatching(qualifying={"a", "b"}, dollars_per_call=0.3)
+    fake_draft = _CostingDrafting(dollars_per_call=0.4)
+    monkeypatch.setattr(discovery, "find_professors", fake_disc)
+    monkeypatch.setattr(matching, "match_projects_for_run", fake_match)
+    monkeypatch.setattr(drafting, "draft_emails_for_run", fake_draft)
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["run", "--inputs", str(inputs), "--yes"])
+
+    assert result.exit_code == 0, result.output
+
+    with get_session() as session:
+        run = _the_run(session)
+        rows = repo.list_recent_run_usage(session)
+        assert len(rows) == 1
+        row = rows[0]
+        assert row.run_id == run.id
+        assert row.count == 2
+        # The JSON value carries the tagged costs + realized counts; unpack to read.
+        costs, counts = usage.unpack_stage_usage(row.stage_costs)
+        # Costs are keyed by usage.STAGES and total the recorded spend:
+        # discovery $0.20, matching $0.30, drafting $0.40.
+        assert set(costs) == set(usage.STAGES)
+        assert costs["discovery"] == pytest.approx(0.2)
+        assert costs["matching"] == pytest.approx(0.3)
+        assert costs["drafting"] == pytest.approx(0.4)
+        assert row.total_usd == pytest.approx(0.9)
+        # A full run drafted all 2 professors -> realized per-stage counts all 2.
+        assert counts == {"discovery": 2, "matching": 2, "drafting": 2}
+
+
+# ---------------------------------------------------------------------------
+# Fail-closed on unpriced (unknown-model) spend under a budget ceiling
+#
+# An unknown-model call costs $0.00 to total_cost_usd only because we have no
+# rate for it — NOT because it was free. Under an active budget that unmeasurable
+# spend is itself a stop condition (fail-closed), so the run must stop at the
+# next boundary even when recognized spend is tiny. With NO budget the unknown
+# model must NOT stop the run (it only surfaces in the usage summary).
+# ---------------------------------------------------------------------------
+
+
+def _record_unpriced(label: str, input_tokens: int) -> None:
+    """Record one UNKNOWN-model call against the CLI-installed tracker.
+
+    The model id is absent from PRICING, so the call is unpriced: it contributes
+    $0.00 to total_cost_usd but flips tracker.has_unpriced_calls to True.
+    """
+    from scholarapp import usage
+
+    usage.record(label, "claude-bogus-9-9", _Usage(input_tokens))
+
+
+class _UnpricedMatching(_FakeMatching):
+    """_FakeMatching that records an UNPRICED (unknown-model) matching call.
+
+    Matching still completes its matches (so a professor IS matched), but the
+    recorded spend is unmeasurable against any budget. The post-matching boundary
+    checks must fail closed regardless of recognized spend.
+    """
+
+    async def __call__(self, **kwargs: Any) -> list[list[matching.MatchedProject]]:
+        _record_unpriced("match_projects", 10_000)
+        return await super().__call__(**kwargs)
+
+
+class _UnpricedDiscovery(_FakeDiscovery):
+    """_FakeDiscovery that records an UNPRICED (unknown-model) discovery call.
+
+    Spend is unmeasurable against any budget, so the next boundary check must
+    fail closed and stop the run regardless of recognized spend.
+    """
+
+    async def __call__(self, **kwargs: Any) -> discovery.DiscoveryResult:
+        _record_unpriced("extract_email", 10_000)
+        return await super().__call__(**kwargs)
+
+
+def test_unpriced_spend_under_budget_stops_at_next_boundary(e2e_setup, monkeypatch):
+    """An unknown-model call under a generous budget stops the run fail-closed.
+
+    Matching records an UNPRICED call (cost $0.00) under a $100 budget — far above
+    any recognized spend — after matching the single professor `a`. The post-match
+    boundary checks must still trip on the unpriced spend and fall into partial
+    delivery (drafts the 1 matched professor, ends REVIEW), and the summary must
+    name the unaccountable spend.
+    """
+    inputs = e2e_setup["inputs"]
+    _mock_ingestion(monkeypatch, count=3)
+
+    # Initial pass matches only `a`; a top-up would normally follow, but the
+    # unpriced spend recorded during matching trips the budget gate first.
+    fake_disc = _FakeDiscovery(pool=["a", "b", "c", "d", "e"])
+    fake_match = _UnpricedMatching(qualifying={"a", "d", "e"})
+    fake_draft = _FakeDrafting()
+    monkeypatch.setattr(discovery, "find_professors", fake_disc)
+    monkeypatch.setattr(matching, "match_projects_for_run", fake_match)
+    monkeypatch.setattr(drafting, "draft_emails_for_run", fake_draft)
+
+    runner = CliRunner()
+    # $100 ceiling is never reached by recognized spend ($0.00 here); only the
+    # unpriced call trips the gate — proving fail-closed, not a ceiling crossing.
+    result = runner.invoke(
+        app, ["run", "--inputs", str(inputs), "--budget", "100", "--yes"]
+    )
+
+    assert result.exit_code == 0, result.output
+    # The gate tripped right after the initial match — no top-up pass ran.
+    assert len(fake_disc.calls) == 1
+    # Partial delivery drafted the single matched professor.
+    assert fake_draft.request_counts == [1]
+    # The end-of-run summary names the fail-closed unaccountable spend, and the
+    # plain "budget reached: spent ... of ... budget" summary line is NOT used
+    # (the unpriced message takes precedence). The mid-run top-up progress warning
+    # may still say "budget reached during top-up" — that's a separate notice.
+    assert "could not be measured" in result.output
+    assert "budget reached: spent" not in result.output.lower()
+
+    with get_session() as session:
+        run = _the_run(session)
+        # Partial delivery ends in the normal REVIEW state, not FAILED.
+        assert run.status == RunStatus.REVIEW
+        assert len(repo.list_drafts_for_run(session, run.id)) == 1
+
+
+def test_unpriced_spend_during_discovery_skips_matching_fail_closed(e2e_setup, monkeypatch):
+    """Unpriced spend recorded in DISCOVERY trips the pre-matching gate, drafts none.
+
+    Discovery records the unpriced call, so the pre-matching boundary check (after
+    discovery) fails closed before matching runs — nothing matches and partial
+    delivery drafts zero. A clean, non-FAILED run that names the unaccountable
+    spend.
+    """
+    inputs = e2e_setup["inputs"]
+    _mock_ingestion(monkeypatch, count=3)
+
+    fake_disc = _UnpricedDiscovery(pool=["a", "b", "c", "d", "e"])
+    fake_match = _FakeMatching(qualifying={"a", "d", "e"})
+    fake_draft = _FakeDrafting()
+    monkeypatch.setattr(discovery, "find_professors", fake_disc)
+    monkeypatch.setattr(matching, "match_projects_for_run", fake_match)
+    monkeypatch.setattr(drafting, "draft_emails_for_run", fake_draft)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["run", "--inputs", str(inputs), "--budget", "100", "--yes"]
+    )
+
+    assert result.exit_code == 0, result.output
+    # Matching was skipped (fail-closed before it ran), so nothing was drafted.
+    assert fake_match.matched_names == []
+    assert fake_draft.request_counts == []
+    # The post-discovery boundary check fired on the unpriced spend, skipping match.
+    assert "Budget reached after discovery" in result.output
+    # The end-of-run summary names the fail-closed unaccountable spend, not the
+    # plain ceiling line.
+    assert "could not be measured" in result.output
+    assert "budget reached: spent" not in result.output.lower()
+
+    with get_session() as session:
+        run = _the_run(session)
+        # A nothing-to-draft run is NOT a failure (it ends in the drafting phase's
+        # nothing-to-draft terminal path), but it must never be FAILED.
+        assert run.status != RunStatus.FAILED
+        assert repo.list_drafts_for_run(session, run.id) == []
+
+
+def test_unpriced_spend_with_no_budget_does_not_stop(e2e_setup, monkeypatch):
+    """No budget + an unknown-model call must NOT stop the run (gate stays off)."""
+    inputs = e2e_setup["inputs"]
+    monkeypatch.delenv("RUN_MAX_USD", raising=False)
+    _mock_ingestion(monkeypatch, count=2)
+
+    # Both professors qualify; the unpriced discovery call must not gate anything
+    # because there's no active budget.
+    fake_disc = _UnpricedDiscovery(pool=["a", "b"])
+    fake_match = _FakeMatching(qualifying={"a", "b"})
+    fake_draft = _FakeDrafting()
+    monkeypatch.setattr(discovery, "find_professors", fake_disc)
+    monkeypatch.setattr(matching, "match_projects_for_run", fake_match)
+    monkeypatch.setattr(drafting, "draft_emails_for_run", fake_draft)
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["run", "--inputs", str(inputs), "--yes"])
+
+    assert result.exit_code == 0, result.output
+    # No budget ⇒ unpriced spend never gates: the full run drafts both professors.
+    assert fake_draft.request_counts == [2]
+    # No budget-stop / fail-closed notice was emitted.
+    assert "could not be measured" not in result.output
+    assert "budget reached" not in result.output.lower()
+
+    with get_session() as session:
+        run = _the_run(session)
+        assert run.status == RunStatus.REVIEW
+        assert len(repo.list_drafts_for_run(session, run.id)) == 2
+
+
+def test_all_priced_under_budget_behaves_as_before(e2e_setup, monkeypatch):
+    """All-priced spend under a generous budget completes a full run unchanged.
+
+    A regression guard: introducing the unpriced trip must not alter the
+    all-known-model path. No fail-closed notice, full delivery, REVIEW status.
+    """
+    inputs = e2e_setup["inputs"]
+    _mock_ingestion(monkeypatch, count=2)
+
+    fake_disc = _CostingDiscovery(pool=["a", "b"], dollars_per_call=0.2)
+    fake_match = _CostingMatching(qualifying={"a", "b"}, dollars_per_call=0.3)
+    fake_draft = _CostingDrafting(dollars_per_call=0.4)
+    monkeypatch.setattr(discovery, "find_professors", fake_disc)
+    monkeypatch.setattr(matching, "match_projects_for_run", fake_match)
+    monkeypatch.setattr(drafting, "draft_emails_for_run", fake_draft)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["run", "--inputs", str(inputs), "--budget", "100", "--yes"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert fake_draft.request_counts == [2]
+    assert "could not be measured" not in result.output
+    assert "budget reached" not in result.output.lower()
+
+    with get_session() as session:
+        run = _the_run(session)
+        assert run.status == RunStatus.REVIEW
+        assert len(repo.list_drafts_for_run(session, run.id)) == 2
+
+
+def test_refused_run_writes_no_run_usage_row(e2e_setup, monkeypatch):
+    """A refuse-to-start run leaves no RunUsage history sample behind."""
+    inputs = e2e_setup["inputs"]
+    _install_fakes(monkeypatch, count=3, pool=["a", "b", "c"], qualifying={"a", "b", "c"})
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["run", "--inputs", str(inputs), "--budget", "0.0001", "--yes"]
+    )
+
+    assert result.exit_code == 1, result.output
+    with get_session() as session:
+        assert repo.list_recent_run_usage(session) == []
+
+
+# ---------------------------------------------------------------------------
+# Budget-stop partial delivery with N>1 matched professors
+# ---------------------------------------------------------------------------
+
+
+def test_budget_crossed_with_multiple_matched_drafts_all_matched(e2e_setup, monkeypatch):
+    """Ceiling trips after >=2 already matched ⇒ partial delivery drafts all of them.
+
+    Requested count is 5; the initial pass matches 2 (`a`, `b`) of the 5 discovered.
+    Initial discovery ($1.00) + initial matching ($0.50) == $1.50 hits the $1.50
+    ceiling, so the top-up boundary check trips with have=2 and the loop breaks.
+    Partial delivery then drafts BOTH matched professors (the existing budget-stop
+    tests only ever exercise a single matched professor).
+    """
+    from scholarapp import usage
+
+    inputs = e2e_setup["inputs"]
+    _mock_ingestion(monkeypatch, count=5)
+
+    fake_disc = _CostingDiscovery(pool=["a", "b", "c", "d", "e"], dollars_per_call=1.0)
+    fake_match = _CostingMatching(qualifying={"a", "b"}, dollars_per_call=0.5)
+    fake_draft = _CostingDrafting(dollars_per_call=0.1)
+    monkeypatch.setattr(discovery, "find_professors", fake_disc)
+    monkeypatch.setattr(matching, "match_projects_for_run", fake_match)
+    monkeypatch.setattr(drafting, "draft_emails_for_run", fake_draft)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["run", "--inputs", str(inputs), "--budget", "1.50", "--yes"]
+    )
+
+    assert result.exit_code == 0, result.output
+    # Only the initial discovery ran — the ceiling broke the top-up loop.
+    assert len(fake_disc.calls) == 1
+    # Both matched professors were drafted in a single drafting call.
+    assert fake_draft.request_counts == [2]
+    assert "Budget reached during top-up" in result.output
+
+    with get_session() as session:
+        run = _the_run(session)
+        assert run.status == RunStatus.REVIEW
+        assert len(repo.list_drafts_for_run(session, run.id)) == 2
+        rows = repo.list_recent_run_usage(session)
+        assert len(rows) == 1
+        _, counts = usage.unpack_stage_usage(rows[0].stage_costs)
+        # Realized drafting count is the 2 actually drafted, not the requested 5.
+        assert counts["drafting"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Budget crossed by a TOP-UP pass's OWN discovery ⇒ that pass's freshly
+# discovered professors are NOT matched (post-discovery in-loop boundary check)
+# ---------------------------------------------------------------------------
+
+
+def test_budget_crossed_by_topup_discovery_skips_that_pass_matching(
+    e2e_setup, monkeypatch
+):
+    """A top-up pass's own discovery hits the ceiling ⇒ skip matching that pass.
+
+    This exercises the in-loop, POST-discovery boundary check (after a top-up pass
+    discovers + persists but BEFORE it matches), distinct from the pre-pass check
+    that fires before a top-up discovers at all. Each discovery costs $1.00 and each
+    matching $0.10. Sequence under a $2.05 ceiling:
+
+      - Initial: discovery $1.00 (< $2.05 → match runs), matching $0.10 → $1.10.
+        Only `a` qualifies → have=1, short of count=3.
+      - Top-up pre-pass check: $1.10 < $2.05 → the loop proceeds to discover.
+      - Top-up discovery: +$1.00 → $2.10, persisting professors that WOULD match
+        (`d` qualifies). The post-discovery check now trips ($2.10 >= $2.05) and the
+        loop breaks BEFORE matching them — so `d` is discovered+persisted but never
+        matched, and partial delivery drafts only the initially matched `a`.
+    """
+    inputs = e2e_setup["inputs"]
+    _mock_ingestion(monkeypatch, count=3)
+
+    # `a` (initial) and `d` (a later top-up survivor) both qualify, so if matching
+    # ran for the top-up pass `d` WOULD match — the only reason it doesn't is the
+    # post-discovery budget break. The first pass returns a,b,c (only `a` matches).
+    fake_disc = _CostingDiscovery(pool=["a", "b", "c", "d", "e"], dollars_per_call=1.0)
+    fake_match = _CostingMatching(qualifying={"a", "d"}, dollars_per_call=0.1)
+    fake_draft = _CostingDrafting(dollars_per_call=0.1)
+    monkeypatch.setattr(discovery, "find_professors", fake_disc)
+    monkeypatch.setattr(matching, "match_projects_for_run", fake_match)
+    monkeypatch.setattr(drafting, "draft_emails_for_run", fake_draft)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["run", "--inputs", str(inputs), "--budget", "2.05", "--yes"]
+    )
+
+    assert result.exit_code == 0, result.output
+    # The top-up pass DID discover (2 discovery calls) — the pre-pass check did NOT
+    # stop it; the break happened only AFTER that pass's discovery.
+    assert len(fake_disc.calls) == 2
+    # Matching ran exactly once — for the INITIAL pass only. The top-up pass's
+    # professors were discovered but never matched (the loop broke before matching).
+    assert fake_match.matched_names == ["Prof a"]
+    # Partial delivery drafted only the single initially matched professor.
+    assert fake_draft.request_counts == [1]
+    assert "Budget reached during top-up" in result.output
+
+    with get_session() as session:
+        run = _the_run(session)
+        # A clean partial delivery: REVIEW, never FAILED.
+        assert run.status == RunStatus.REVIEW
+        drafts = repo.list_drafts_for_run(session, run.id)
+        professors = repo.list_professors_for_run(session, run.id)
+    # The top-up pass's professor(s) WERE persisted (discovery ran), but only the
+    # matched `a` is drafted — proving freshly discovered, unmatched profs are
+    # dropped from the delivered count.
+    assert len(drafts) == 1
+    assert len(professors) > 1
+
+
+def test_budget_crossed_by_topup_discovery_no_budget_unaffected(
+    e2e_setup, monkeypatch
+):
+    """The post-discovery in-loop check must NOT fire when there is no ceiling.
+
+    Same costing fakes as the budget variant, but with NO --budget / RUN_MAX_USD:
+    `_over_budget` returns False (effective_budget is None), so the loop tops up
+    normally and reaches count — proving the new boundary check is inert without a
+    ceiling.
+    """
+    inputs = e2e_setup["inputs"]
+    monkeypatch.delenv("RUN_MAX_USD", raising=False)
+    _mock_ingestion(monkeypatch, count=3)
+
+    # `a` (initial) + `d`, `e` (top-up survivors) qualify, so an uncapped run reaches
+    # count=3 across passes.
+    fake_disc = _CostingDiscovery(pool=["a", "b", "c", "d", "e"], dollars_per_call=1.0)
+    fake_match = _CostingMatching(qualifying={"a", "d", "e"}, dollars_per_call=0.1)
+    fake_draft = _CostingDrafting(dollars_per_call=0.1)
+    monkeypatch.setattr(discovery, "find_professors", fake_disc)
+    monkeypatch.setattr(matching, "match_projects_for_run", fake_match)
+    monkeypatch.setattr(drafting, "draft_emails_for_run", fake_draft)
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["run", "--inputs", str(inputs), "--yes"])
+
+    assert result.exit_code == 0, result.output
+    # No budget ⇒ the new check never trips: the loop tops up and reaches count=3.
+    assert "Budget reached during top-up" not in result.output
+    assert fake_draft.request_counts == [3]
+
+    with get_session() as session:
+        run = _the_run(session)
+        assert run.status == RunStatus.REVIEW
+        assert len(repo.list_drafts_for_run(session, run.id)) == 3
+
+
+# ---------------------------------------------------------------------------
+# RUN_MAX_USD=<non-numeric> through `run` ⇒ clean ConfigError, no traceback
+# ---------------------------------------------------------------------------
+
+
+def test_run_max_usd_non_numeric_renders_clean_error(e2e_setup, monkeypatch):
+    """A genuinely non-numeric RUN_MAX_USD hard-stops `run` with a friendly message.
+
+    nan/inf/-5 all parse via float() and are unit-tested elsewhere; a value that
+    fails float() parsing (`abc`) must surface as the controlled config message —
+    exit 1, no Python traceback — when `run` reads the ceiling.
+    """
+    inputs = e2e_setup["inputs"]
+    fake_disc, _, fake_draft = _install_fakes(
+        monkeypatch, count=2, pool=["a", "b"], qualifying={"a", "b"}
+    )
+    monkeypatch.setenv("RUN_MAX_USD", "abc")
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["run", "--inputs", str(inputs), "--yes"])
+
+    assert result.exit_code == 1, result.output
+    # The controlled ConfigError message, not a raw float() ValueError.
+    assert "RUN_MAX_USD must be a number" in result.output
+    assert "abc" in result.output
+    # No traceback leaked: ScholarError is caught and rendered via ui.error.
+    assert "Traceback" not in result.output
+    # The bad ceiling stops the run before any paid stage.
+    assert fake_disc.calls == []
+    assert fake_draft.request_counts == []
+
+
+# ---------------------------------------------------------------------------
+# A FAILED drafting run writes no RunUsage history sample
+# ---------------------------------------------------------------------------
+
+
+def test_failed_drafting_run_writes_no_run_usage_row(e2e_setup, monkeypatch):
+    """Drafting raising a ScholarError ⇒ run FAILED, exit 1, no history sample.
+
+    The refused/declined no-row cases are covered; this pins the FAILED path: a
+    crash during drafting must not leave a misleading RunUsage sample behind.
+    """
+    inputs = e2e_setup["inputs"]
+
+    class _RaisingDrafting(_FakeDrafting):
+        async def __call__(self, **kwargs: Any) -> list[drafting.EmailDraft]:
+            raise DraftingError("Anthropic returned 500 during drafting.")
+
+    _mock_ingestion(monkeypatch, count=2)
+    fake_disc = _FakeDiscovery(pool=["a", "b"])
+    fake_match = _FakeMatching(qualifying={"a", "b"})
+    fake_draft = _RaisingDrafting()
+    monkeypatch.setattr(discovery, "find_professors", fake_disc)
+    monkeypatch.setattr(matching, "match_projects_for_run", fake_match)
+    monkeypatch.setattr(drafting, "draft_emails_for_run", fake_draft)
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["run", "--inputs", str(inputs), "--yes"])
+
+    assert result.exit_code == 1, result.output
+
+    with get_session() as session:
+        run = _the_run(session)
+        assert run.status == RunStatus.FAILED
+        # No drafts persisted and — crucially — no history sample written.
+        assert repo.list_drafts_for_run(session, run.id) == []
+        assert repo.list_recent_run_usage(session) == []
+
+
+# ---------------------------------------------------------------------------
+# Historical-basis feedback loop end-to-end
+# ---------------------------------------------------------------------------
+
+
+def test_historical_basis_estimate_after_enough_priced_runs(e2e_setup, monkeypatch):
+    """Once enough completed priced runs exist, a later run estimates HISTORICALLY.
+
+    The first run writes a count-bearing RunUsage sample (all stages realized 2
+    professors). With _MIN_HISTORY_SAMPLES monkeypatched down to 1, the second
+    run's pre-flight estimate crosses the threshold and renders the historical
+    basis wording ("based on the last N run(s)") instead of the static guess —
+    exercising _recent_cost_history's ORM->RunCostSample unpack end-to-end.
+    """
+    from scholarapp import usage
+
+    inputs = e2e_setup["inputs"]
+    # Small threshold so a single completed run is enough — fast and non-flaky.
+    monkeypatch.setattr(usage, "_MIN_HISTORY_SAMPLES", 1)
+
+    def _install_costing() -> _CostingDrafting:
+        fake_disc = _CostingDiscovery(pool=["a", "b"], dollars_per_call=0.2)
+        fake_match = _CostingMatching(qualifying={"a", "b"}, dollars_per_call=0.3)
+        fake_draft = _CostingDrafting(dollars_per_call=0.4)
+        monkeypatch.setattr(discovery, "find_professors", fake_disc)
+        monkeypatch.setattr(matching, "match_projects_for_run", fake_match)
+        monkeypatch.setattr(drafting, "draft_emails_for_run", fake_draft)
+        return fake_draft
+
+    runner = CliRunner()
+
+    # First run: no history yet ⇒ static basis, and it persists one sample.
+    _mock_ingestion(monkeypatch, count=2)
+    first_draft = _install_costing()
+    first = runner.invoke(app, ["run", "--inputs", str(inputs), "--yes"])
+    assert first.exit_code == 0, first.output
+    assert "static estimate" in first.output
+    assert first_draft.request_counts == [2]
+    with get_session() as session:
+        assert len(repo.list_recent_run_usage(session)) == 1
+
+    # Second run: one count-bearing prior sample crosses the (patched) threshold,
+    # so the estimate panel must now read the historical-basis wording.
+    _mock_ingestion(monkeypatch, count=2)
+    _install_costing()
+    second = runner.invoke(app, ["run", "--inputs", str(inputs), "--yes"])
+    assert second.exit_code == 0, second.output
+    assert "based on the last 1 run" in second.output
+    assert "static estimate" not in second.output
