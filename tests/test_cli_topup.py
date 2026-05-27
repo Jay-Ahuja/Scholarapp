@@ -1598,6 +1598,109 @@ def test_budget_crossed_with_multiple_matched_drafts_all_matched(e2e_setup, monk
 
 
 # ---------------------------------------------------------------------------
+# Budget crossed by a TOP-UP pass's OWN discovery ⇒ that pass's freshly
+# discovered professors are NOT matched (post-discovery in-loop boundary check)
+# ---------------------------------------------------------------------------
+
+
+def test_budget_crossed_by_topup_discovery_skips_that_pass_matching(
+    e2e_setup, monkeypatch
+):
+    """A top-up pass's own discovery hits the ceiling ⇒ skip matching that pass.
+
+    This exercises the in-loop, POST-discovery boundary check (after a top-up pass
+    discovers + persists but BEFORE it matches), distinct from the pre-pass check
+    that fires before a top-up discovers at all. Each discovery costs $1.00 and each
+    matching $0.10. Sequence under a $2.05 ceiling:
+
+      - Initial: discovery $1.00 (< $2.05 → match runs), matching $0.10 → $1.10.
+        Only `a` qualifies → have=1, short of count=3.
+      - Top-up pre-pass check: $1.10 < $2.05 → the loop proceeds to discover.
+      - Top-up discovery: +$1.00 → $2.10, persisting professors that WOULD match
+        (`d` qualifies). The post-discovery check now trips ($2.10 >= $2.05) and the
+        loop breaks BEFORE matching them — so `d` is discovered+persisted but never
+        matched, and partial delivery drafts only the initially matched `a`.
+    """
+    inputs = e2e_setup["inputs"]
+    _mock_ingestion(monkeypatch, count=3)
+
+    # `a` (initial) and `d` (a later top-up survivor) both qualify, so if matching
+    # ran for the top-up pass `d` WOULD match — the only reason it doesn't is the
+    # post-discovery budget break. The first pass returns a,b,c (only `a` matches).
+    fake_disc = _CostingDiscovery(pool=["a", "b", "c", "d", "e"], dollars_per_call=1.0)
+    fake_match = _CostingMatching(qualifying={"a", "d"}, dollars_per_call=0.1)
+    fake_draft = _CostingDrafting(dollars_per_call=0.1)
+    monkeypatch.setattr(discovery, "find_professors", fake_disc)
+    monkeypatch.setattr(matching, "match_projects_for_run", fake_match)
+    monkeypatch.setattr(drafting, "draft_emails_for_run", fake_draft)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["run", "--inputs", str(inputs), "--budget", "2.05", "--yes"]
+    )
+
+    assert result.exit_code == 0, result.output
+    # The top-up pass DID discover (2 discovery calls) — the pre-pass check did NOT
+    # stop it; the break happened only AFTER that pass's discovery.
+    assert len(fake_disc.calls) == 2
+    # Matching ran exactly once — for the INITIAL pass only. The top-up pass's
+    # professors were discovered but never matched (the loop broke before matching).
+    assert fake_match.matched_names == ["Prof a"]
+    # Partial delivery drafted only the single initially matched professor.
+    assert fake_draft.request_counts == [1]
+    assert "Budget reached during top-up" in result.output
+
+    with get_session() as session:
+        run = _the_run(session)
+        # A clean partial delivery: REVIEW, never FAILED.
+        assert run.status == RunStatus.REVIEW
+        drafts = repo.list_drafts_for_run(session, run.id)
+        professors = repo.list_professors_for_run(session, run.id)
+    # The top-up pass's professor(s) WERE persisted (discovery ran), but only the
+    # matched `a` is drafted — proving freshly discovered, unmatched profs are
+    # dropped from the delivered count.
+    assert len(drafts) == 1
+    assert len(professors) > 1
+
+
+def test_budget_crossed_by_topup_discovery_no_budget_unaffected(
+    e2e_setup, monkeypatch
+):
+    """The post-discovery in-loop check must NOT fire when there is no ceiling.
+
+    Same costing fakes as the budget variant, but with NO --budget / RUN_MAX_USD:
+    `_over_budget` returns False (effective_budget is None), so the loop tops up
+    normally and reaches count — proving the new boundary check is inert without a
+    ceiling.
+    """
+    inputs = e2e_setup["inputs"]
+    monkeypatch.delenv("RUN_MAX_USD", raising=False)
+    _mock_ingestion(monkeypatch, count=3)
+
+    # `a` (initial) + `d`, `e` (top-up survivors) qualify, so an uncapped run reaches
+    # count=3 across passes.
+    fake_disc = _CostingDiscovery(pool=["a", "b", "c", "d", "e"], dollars_per_call=1.0)
+    fake_match = _CostingMatching(qualifying={"a", "d", "e"}, dollars_per_call=0.1)
+    fake_draft = _CostingDrafting(dollars_per_call=0.1)
+    monkeypatch.setattr(discovery, "find_professors", fake_disc)
+    monkeypatch.setattr(matching, "match_projects_for_run", fake_match)
+    monkeypatch.setattr(drafting, "draft_emails_for_run", fake_draft)
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["run", "--inputs", str(inputs), "--yes"])
+
+    assert result.exit_code == 0, result.output
+    # No budget ⇒ the new check never trips: the loop tops up and reaches count=3.
+    assert "Budget reached during top-up" not in result.output
+    assert fake_draft.request_counts == [3]
+
+    with get_session() as session:
+        run = _the_run(session)
+        assert run.status == RunStatus.REVIEW
+        assert len(repo.list_drafts_for_run(session, run.id)) == 3
+
+
+# ---------------------------------------------------------------------------
 # RUN_MAX_USD=<non-numeric> through `run` ⇒ clean ConfigError, no traceback
 # ---------------------------------------------------------------------------
 

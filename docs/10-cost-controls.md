@@ -46,8 +46,11 @@ The flow:
 4. **Budget enforcement at stage / top-up-pass / draft boundaries.** The helper
    `_over_budget(effective_budget, tracker)` compares `tracker.total_cost_usd`
    (already-recorded spend) against the ceiling with `>=`. It is checked
-   *between* stages: pre-discovery, pre-matching, before each top-up pass, and
-   pre-drafting. This is **best-effort**: a single stage can overshoot the
+   *between* stages: pre-discovery, pre-matching, before each top-up pass, after
+   a top-up pass's own discovery and before that pass's matching (so a top-up
+   pass whose discovery reaches the ceiling stops before paying for matching —
+   the just-discovered professors are left unmatched and partial delivery skips
+   them), and pre-drafting. This is **best-effort**: a single stage can overshoot the
    ceiling internally because a Claude call is never aborted mid-flight. The gate
    also **fails closed on unpriced spend** (see below): once a budget is active,
    `_over_budget` trips not only on recognized spend reaching the ceiling but also
@@ -251,9 +254,10 @@ protects them.
   `PRICING` (estimated rates) or pooled history; the Anthropic console is the
   authoritative source. Treat the figure as guidance.
 - **Within-stage overshoot is possible.** Budget is checked only at stage / pass
-  / draft boundaries against already-recorded spend (`tracker.total_cost_usd`).
-  A single stage can blow past the ceiling internally — a Claude call is never
-  aborted mid-flight.
+  / draft boundaries against already-recorded spend (`tracker.total_cost_usd`):
+  pre-discovery, pre-matching, before each top-up pass, after a top-up pass's own
+  discovery and before that pass's matching, and pre-drafting. A single stage can
+  blow past the ceiling internally — a Claude call is never aborted mid-flight.
 - **The gate runs after Parse.** Resume + prompt parsing cost is always incurred
   to learn `count`. A refusal or decline still pays for those two ingestion
   calls (and a resume-cache hit makes the resume parse free).

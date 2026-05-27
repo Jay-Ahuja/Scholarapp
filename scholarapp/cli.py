@@ -791,6 +791,22 @@ def run(
             # still paid for its pool, and the next pass must not re-pull it.
             seen_openalex_ids.update(topup_attempted_ids)
 
+            # Post-discovery boundary check WITHIN this top-up pass — mirrors the
+            # initial pass's pre-matching check (this pass's own discovery may have
+            # pushed recorded spend to the ceiling). If so, stop BEFORE matching:
+            # this pass's freshly discovered professors are NOT matched (they have no
+            # completed match, so partial delivery below skips them). We never abort
+            # the in-flight discovery that just ran — this is a between-stages gate on
+            # already-recorded spend — and a no-ceiling run is unaffected because
+            # `_over_budget` returns False when effective_budget is None.
+            if _over_budget(effective_budget, tracker):
+                stop_reason = "budget"
+                ui.warn(
+                    f"Budget reached during top-up — stopping with {have} of {count} "
+                    "professors."
+                )
+                break
+
             # Match this pass's newly-persisted professors FIRST, before deciding
             # whether to stop. A pass that exhausts OpenAlex can STILL return
             # matchable survivors (the final page that drains the pool), so we must
